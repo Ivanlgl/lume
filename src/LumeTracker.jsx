@@ -49,6 +49,7 @@ const store = {
   },
 };
 const BAK_PREFIX = "lume-bak-";
+const ADMIN_EMAILS = ["ivangllim@gmail.com"];
 
 const FX = { SGD: 1, MYR: 0.29, USD: 1.35 };
 const CUR_SYM = { SGD: "S$", MYR: "RM ", USD: "US$", JPY: "¥" };
@@ -544,6 +545,12 @@ export default function LumeTracker() {
   const lastPushRef = useRef(0);
   const hiddenAtRef = useRef(null);
   const initLockRef = useRef(false);
+  const screenRef = useRef("signin");
+  const [avatarMenu, setAvatarMenu] = useState(false);
+  const [signinMethod, setSigninMethod] = useState("email"); // email | phone
+  const [signinPhone, setSigninPhone] = useState("");
+  const [otpStage, setOtpStage] = useState(false);
+  const [otpCode, setOtpCode] = useState("");
   const [editExpense, setEditExpense] = useState(null); // expense object or "new"
   const [editAccount, setEditAccount] = useState(null); // account object or "new"
   const [editMember, setEditMember] = useState(null);   // member object or "new"
@@ -664,6 +671,26 @@ export default function LumeTracker() {
     const { error } = await supa.auth.signInWithOAuth({ provider, options: { redirectTo: window.location.origin } });
     if (error) { setAuthMsg(error.message); setAuthBusy(false); }
   };
+  const phoneOtp = async () => {
+    if (!supa) { setScreen("home"); return; }
+    let ph = signinPhone.trim().replace(/[\s-]/g, "");
+    if (/^[89]\d{7}$/.test(ph)) ph = "+65" + ph;          // bare SG numbers get the country code
+    if (!/^\+\d{8,15}$/.test(ph)) { setAuthMsg("Enter a mobile number with country code, e.g. +65 9123 4567."); return; }
+    setAuthBusy(true); setAuthMsg("");
+    const { error } = await supa.auth.signInWithOtp({ phone: ph });
+    setAuthBusy(false);
+    if (error) { setAuthMsg(error.message); return; }
+    setSigninPhone(ph); setOtpStage(true); setAuthMsg("We sent a 6-digit code to " + ph + ".");
+  };
+  const phoneVerify = async () => {
+    if (!supa) return;
+    const code = otpCode.trim();
+    if (!/^\d{6}$/.test(code)) { setAuthMsg("Enter the 6-digit code from the SMS."); return; }
+    setAuthBusy(true); setAuthMsg("");
+    const { error } = await supa.auth.verifyOtp({ phone: signinPhone, token: code, type: "sms" });
+    setAuthBusy(false);
+    if (error) setAuthMsg(error.message);
+  };
   const emailLink = async () => {
     if (!supa) { setScreen("home"); return; }
     const em = signinEmail.trim();
@@ -674,6 +701,21 @@ export default function LumeTracker() {
     setAuthMsg(error ? error.message : "Check your inbox — we sent you a sign-in link.");
   };
   const signOut = async () => { if (supa) { await supa.auth.signOut(); } setScreen("signin"); };
+  // Hardware/browser back: never return to the sign-in page. Inside the app,
+  // back goes Home first; back again asks whether to sign out.
+  useEffect(() => { screenRef.current = screen; }, [screen]);
+  useEffect(() => {
+    history.pushState({ lume: 1 }, "");
+    const onPop = () => {
+      const s = screenRef.current;
+      if (s === "signin") { history.pushState({ lume: 1 }, ""); return; }
+      if (s !== "home") { setScreen("home"); history.pushState({ lume: 1 }, ""); return; }
+      if (confirm("Sign out of Lume?")) { signOut(); history.pushState({ lume: 1 }, ""); }
+      else history.pushState({ lume: 1 }, "");
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
 
   const dataKey = session?.user?.id ? "lume-u-" + session.user.id : "lume-data-v1";
   const bakPrefix = session?.user?.id ? "lume-bak-" + session.user.id.slice(0, 8) + "-" : "lume-bak-local-";
@@ -711,7 +753,10 @@ export default function LumeTracker() {
 
   const isPremium = !!(data && data.premium);
   const openPaywall = (f) => { setPaywallFeature(f); setSheet("paywall"); };
-  const upgrade = () => { persist({ ...data, premium: true }); setSheet(null); };
+  const upgrade = () => {
+    if (isAdmin) { persist({ ...data, premium: true }); setSheet(null); return; }
+    alert("Payments are launching soon — Lume Plus is currently invite-only. Drop us a note and we'll set you up.");
+  };
   const downgrade = () => { persist({ ...data, premium: false }); };
   const mask = (t) => (privacy ? "S$ ••••••" : t);
   const openShare = () => { setShareChart(screen === "expenses" ? "spend" : "nw"); setSaved(false); setSheet("share"); };
@@ -892,7 +937,22 @@ export default function LumeTracker() {
   const scrollScreen = { position: "relative", height: "100%", overflowY: "auto", WebkitOverflowScrolling: "touch", boxSizing: "border-box", padding: "76px 18px calc(150px + env(safe-area-inset-bottom))", animation: "rise .35s ease-out" };
   const demoPill = { ...mono(9, 700), letterSpacing: ".08em", padding: "3px 8px", borderRadius: 999, background: "rgba(217,164,65,.2)", color: "#A06E15", flexShrink: 0 };
   const Avatar = () => (
-    <button onClick={() => setScreen("settings")} style={{ width: 40, height: 40, borderRadius: 20, border: "1px solid rgba(255,255,255,.7)", background: me?.gradient || GRADIENTS._palette[0], cursor: "pointer", color: "#fff", fontWeight: 700, fontSize: 14, boxShadow: "inset 0 1px 0 rgba(255,255,255,.5)", flexShrink: 0 }}>{me?.initials || "?"}</button>
+    <div style={{ position: "relative", flexShrink: 0 }}>
+      <button onClick={() => setAvatarMenu(!avatarMenu)} style={{ width: 40, height: 40, borderRadius: 20, border: "1px solid rgba(255,255,255,.7)", background: me?.gradient || GRADIENTS._palette[0], cursor: "pointer", color: "#fff", fontWeight: 700, fontSize: 14, boxShadow: "inset 0 1px 0 rgba(255,255,255,.5)" }}>{me?.initials || "?"}</button>
+      {avatarMenu && (
+        <>
+          <div onClick={() => setAvatarMenu(false)} style={{ position: "fixed", inset: 0, zIndex: 44 }} />
+          <div style={{ position: "absolute", top: 46, right: 0, zIndex: 45, minWidth: 168, borderRadius: 16, background: "rgba(255,255,255,.92)", backdropFilter: "blur(24px)", WebkitBackdropFilter: "blur(24px)", border: "1px solid rgba(255,255,255,.85)", boxShadow: "0 18px 40px -12px rgba(23,42,72,.35)", padding: 6, animation: "fadein .15s" }}>
+            <div style={{ padding: "8px 12px 6px", borderBottom: "1px solid rgba(20,38,61,.07)" }}>
+              <div style={{ fontSize: 12.5, fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{me?.fullName || me?.name || "You"}</div>
+              {sessionEmail && <div style={{ fontSize: 10.5, color: "rgba(20,38,61,.5)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{sessionEmail}</div>}
+            </div>
+            <button onClick={() => { setAvatarMenu(false); setScreen("settings"); }} style={{ width: "100%", textAlign: "left", display: "flex", alignItems: "center", gap: 9, border: "none", background: "none", padding: "9px 12px", borderRadius: 10, cursor: "pointer", fontFamily: F_UI, fontSize: 13, fontWeight: 600, color: INK }}><Ico as={ShieldCheck} size={15} color="rgba(20,38,61,.6)" />Settings</button>
+            <button onClick={() => { setAvatarMenu(false); if (confirm("Sign out of Lume?")) signOut(); }} style={{ width: "100%", textAlign: "left", display: "flex", alignItems: "center", gap: 9, border: "none", background: "none", padding: "9px 12px", borderRadius: 10, cursor: "pointer", fontFamily: F_UI, fontSize: 13, fontWeight: 600, color: NEG }}><Ico as={ChevronRight} size={15} color={NEG} />Sign out</button>
+          </div>
+        </>
+      )}
+    </div>
   );
   const Header = ({ over, title, onShare, back }) => (
     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18 }}>
@@ -921,21 +981,35 @@ export default function LumeTracker() {
         <button disabled={authBusy} onClick={() => oauth("google")} style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, height: 52, border: "none", borderRadius: 26, background: INK, color: "#fff", fontFamily: F_UI, fontSize: 15.5, fontWeight: 600, cursor: authBusy ? "wait" : "pointer", opacity: authBusy ? .6 : 1, boxShadow: "0 14px 26px -12px rgba(20,38,61,.5)" }}>
           <svg width="17" height="17" viewBox="0 0 24 24"><path fill="#fff" d="M21.35 11.1H12v3.7h5.4c-.5 2.4-2.6 3.9-5.4 3.9a6.7 6.7 0 1 1 0-13.4c1.7 0 3.2.6 4.3 1.7l2.7-2.7A10.4 10.4 0 1 0 12 22.4c6 0 10-4.2 10-10.1 0-.4 0-.8-.1-1.2Z" /></svg>Continue with Google
         </button>
-        <button disabled={authBusy} onClick={() => oauth("apple")} style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, height: 52, border: "none", borderRadius: 26, background: "#000", color: "#fff", fontFamily: F_UI, fontSize: 15.5, fontWeight: 600, cursor: authBusy ? "wait" : "pointer", opacity: authBusy ? .6 : 1, boxShadow: "0 14px 26px -12px rgba(0,0,0,.5)" }}>
-          <svg width="16" height="18" viewBox="0 0 24 24" fill="#fff"><path d="M17.05 12.04c-.03-2.6 2.13-3.85 2.22-3.91-1.21-1.77-3.09-2.01-3.76-2.04-1.6-.16-3.12.94-3.93.94-.81 0-2.06-.92-3.39-.9-1.74.03-3.35 1.01-4.25 2.57-1.81 3.15-.46 7.82 1.3 10.38.86 1.25 1.89 2.66 3.23 2.61 1.3-.05 1.79-.84 3.36-.84 1.57 0 2.01.84 3.39.81 1.4-.02 2.29-1.28 3.15-2.54.99-1.46 1.4-2.87 1.42-2.94-.03-.01-2.72-1.05-2.75-4.15M14.53 4.4c.72-.87 1.2-2.08 1.07-3.28-1.03.04-2.28.69-3.02 1.55-.66.77-1.24 2-1.08 3.18 1.15.09 2.33-.59 3.03-1.45"/></svg> Continue with Apple
-        </button>
+
         <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "2px 0" }}>
           <span style={{ flex: 1, height: 1, background: "rgba(20,38,61,.12)" }} /><span style={{ fontSize: 11, color: "rgba(20,38,61,.4)" }}>or</span><span style={{ flex: 1, height: 1, background: "rgba(20,38,61,.12)" }} />
         </div>
-        <div style={{ display: "flex", gap: 8 }}>
-          <input value={signinEmail} onChange={(e) => setSigninEmail(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") emailLink(); }} type="email" inputMode="email" autoComplete="email" placeholder="you@email.com" style={{ flex: 1, minWidth: 0, height: 52, borderRadius: 26, border: "1px solid rgba(255,255,255,.75)", background: "rgba(255,255,255,.6)", padding: "0 18px", fontFamily: F_UI, fontSize: 15, color: INK, outline: "none" }} />
-          <button disabled={authBusy} onClick={emailLink} title="Email me a sign-in link" style={{ width: 52, height: 52, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", borderRadius: 26, border: "none", ...glass(26, 20, 0.55), cursor: authBusy ? "wait" : "pointer", opacity: authBusy ? .6 : 1 }}>
-            <Ico as={Mail} size={18} color={INK} />
-          </button>
-        </div>
+        <div style={{ width: 172, alignSelf: "center" }}><Seg items={["Email", "Mobile"]} value={signinMethod === "email" ? "Email" : "Mobile"} onChange={(v) => { setSigninMethod(v === "Email" ? "email" : "phone"); setOtpStage(false); setAuthMsg(""); }} small /></div>
+        {signinMethod === "email" ? (
+          <div style={{ display: "flex", gap: 8 }}>
+            <input value={signinEmail} onChange={(e) => setSigninEmail(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") emailLink(); }} type="email" inputMode="email" autoComplete="email" placeholder="you@email.com" style={{ flex: 1, minWidth: 0, height: 52, borderRadius: 26, border: "1px solid rgba(255,255,255,.75)", background: "rgba(255,255,255,.6)", padding: "0 18px", fontFamily: F_UI, fontSize: 15, color: INK, outline: "none" }} />
+            <button disabled={authBusy} onClick={emailLink} title="Email me a sign-in link" style={{ width: 52, height: 52, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", borderRadius: 26, border: "none", ...glass(26, 20, 0.55), cursor: authBusy ? "wait" : "pointer", opacity: authBusy ? .6 : 1 }}>
+              <Ico as={Mail} size={18} color={INK} />
+            </button>
+          </div>
+        ) : !otpStage ? (
+          <div style={{ display: "flex", gap: 8 }}>
+            <input value={signinPhone} onChange={(e) => setSigninPhone(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") phoneOtp(); }} type="tel" inputMode="tel" autoComplete="tel" placeholder="+65 9123 4567" style={{ flex: 1, minWidth: 0, height: 52, borderRadius: 26, border: "1px solid rgba(255,255,255,.75)", background: "rgba(255,255,255,.6)", padding: "0 18px", fontFamily: F_UI, fontSize: 15, color: INK, outline: "none" }} />
+            <button disabled={authBusy} onClick={phoneOtp} title="Text me a code" style={{ width: 52, height: 52, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", borderRadius: 26, border: "none", ...glass(26, 20, 0.55), cursor: authBusy ? "wait" : "pointer", opacity: authBusy ? .6 : 1 }}>
+              <Ico as={Smartphone} size={18} color={INK} />
+            </button>
+          </div>
+        ) : (
+          <div style={{ display: "flex", gap: 8 }}>
+            <input value={otpCode} onChange={(e) => setOtpCode(e.target.value.replace(/\D/g, "").slice(0, 6))} onKeyDown={(e) => { if (e.key === "Enter") phoneVerify(); }} inputMode="numeric" placeholder="6-digit code" style={{ flex: 1, minWidth: 0, height: 52, borderRadius: 26, border: "1px solid rgba(255,255,255,.75)", background: "rgba(255,255,255,.6)", padding: "0 18px", fontFamily: F_MONO, fontSize: 17, letterSpacing: "0.2em", color: INK, outline: "none", textAlign: "center" }} />
+            <button disabled={authBusy} onClick={phoneVerify} style={{ height: 52, padding: "0 20px", flexShrink: 0, borderRadius: 26, border: "none", background: INK, color: "#fff", fontFamily: F_UI, fontSize: 14, fontWeight: 600, cursor: authBusy ? "wait" : "pointer", opacity: authBusy ? .6 : 1 }}>Verify</button>
+          </div>
+        )}
         {authMsg && <div style={{ fontSize: 12, color: authMsg.startsWith("Check") ? POS : NEG, textAlign: "center", lineHeight: 1.5, padding: "0 4px" }}>{authMsg}</div>}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 7, marginTop: 4, color: "rgba(20,38,61,.5)", fontSize: 11.5, textAlign: "center", lineHeight: 1.5 }}><Ico as={Lock} size={13} color="rgba(20,38,61,.5)" /> Manual entry only — Lume never links to your bank.</div>
         {authReady && !supa && <div style={{ fontSize: 10.5, color: "rgba(20,38,61,.4)", textAlign: "center" }}>Local mode — data stays on this device. Tap any button to continue.</div>}
+        <div style={{ fontSize: 10.5, color: "rgba(20,38,61,.45)", textAlign: "center", lineHeight: 1.5 }}>By continuing you agree to Lume's <button onClick={() => setSheet("legal")} style={{ border: "none", background: "none", color: ACCENT, fontFamily: F_UI, fontSize: 10.5, fontWeight: 600, cursor: "pointer", padding: 0, textDecoration: "underline" }}>Terms & Privacy Policy</button>.</div>
       </div>
       </div>
     </div>
@@ -953,7 +1027,7 @@ export default function LumeTracker() {
         <div><div style={{ fontSize: 12.5, color: "rgba(20,38,61,.55)" }}>Good morning, {me?.name}</div><div style={{ fontSize: 21, fontWeight: 700, letterSpacing: "-.01em", display: "flex", alignItems: "center", gap: 8 }}>Your net worth{data.demo && <span style={demoPill}>DEMO</span>}</div></div>
         <div style={{ display: "flex", gap: 10 }}>
           <IconBtn as={privacy ? EyeOff : Eye} onClick={() => setPrivacy(!privacy)} />
-          <button onClick={() => setScreen("settings")} style={{ width: 40, height: 40, borderRadius: 20, border: "1px solid rgba(255,255,255,.7)", background: me?.gradient || "linear-gradient(135deg,#F0C98F,#D98E6B)", cursor: "pointer", color: "#fff", fontWeight: 700, fontSize: 14, boxShadow: "inset 0 1px 0 rgba(255,255,255,.5)" }}>{me?.initials || "?"}</button>
+          <Avatar />
         </div>
       </div>
       <div style={{ ...heroGlass, padding: "20px 20px 16px", marginBottom: 14 }}>
@@ -1182,7 +1256,7 @@ export default function LumeTracker() {
               <div style={{ width: 40, height: 40, borderRadius: 20, background: m.gradient, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontWeight: 700, fontSize: 14, boxShadow: "inset 0 1px 0 rgba(255,255,255,.5)" }}>{m.initials}</div>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontSize: 14, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{m.fullName || m.name}{isMe && <span style={{ color: "rgba(20,38,61,.4)", fontWeight: 400 }}> · you</span>}</div>
-                <div style={{ fontSize: 11.5, color: "rgba(20,38,61,.5)", marginTop: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{isMe ? "Full control of your data" : grantedToMe ? "You can edit · access granted" : "View only · request to edit"}</div>
+                <div style={{ fontSize: 11.5, color: "rgba(20,38,61,.5)", marginTop: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{m.inviteEmail ? "Invited · " + m.inviteEmail + " · awaiting shared households" : isMe ? "Full control of your data" : grantedToMe ? "You can edit · access granted" : "View only · request to edit"}</div>
               </div>
               <span style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: ".05em", textTransform: "uppercase", padding: "4px 10px", borderRadius: 999, background: m.role === "owner" ? "rgba(20,38,61,.85)" : "rgba(61,90,158,.14)", color: m.role === "owner" ? "#fff" : "#3D5A9E" }}>{m.role}</span>
             </button>
@@ -1313,10 +1387,12 @@ export default function LumeTracker() {
   const dataRows = [
     { label: "Export my data", sub: "Downloads CSV + full JSON backup", icon: Download, color: INK, onClick: exportAllData },
     { label: "Active sessions", sub: "This device", icon: Smartphone, color: INK },
+    { label: "Terms & Privacy Policy", sub: "How Lume handles your data", icon: ShieldCheck, color: INK, onClick: () => setSheet("legal") },
     { label: "Clear all data", sub: "Erase everything, keep your profile", icon: EyeOff, color: NEG, onClick: clearAllData },
     { label: "Delete account & data", sub: "Permanent · double-confirmed", icon: Trash2, color: NEG, onClick: deleteAccountFully },
   ];
   const sessionEmail = session?.user?.email || null;
+  const isAdmin = !!sessionEmail && ADMIN_EMAILS.includes(sessionEmail.toLowerCase());
   const SettingsScreen = () => (
     <div style={scrollScreen}>
       <Header over={(me?.fullName || me?.name || "You") + " · " + (me?.name || "you").toLowerCase() + "@lume.app"} title="Security & privacy" back />
@@ -1326,9 +1402,11 @@ export default function LumeTracker() {
           <div style={{ fontSize: 14.5, fontWeight: 700 }}>Lume Plus {isPremium && <span style={{ ...mono(9, 700), letterSpacing: ".05em", padding: "2px 7px", borderRadius: 999, background: "rgba(21,138,98,.14)", color: POS, verticalAlign: "middle" }}>ACTIVE</span>}</div>
           <div style={{ fontSize: 11.5, color: "rgba(20,38,61,.55)", marginTop: 2 }}>{isPremium ? "Projections, exports & unlimited members unlocked" : "Projections · schedule exports · unlimited members"}</div>
         </div>
-        {isPremium
-          ? <button onClick={() => { if (confirm("Cancel Lume Plus? (demo toggle)")) downgrade(); }} style={{ border: "1px solid rgba(20,38,61,.15)", borderRadius: 18, background: "rgba(255,255,255,.6)", color: INK, fontFamily: F_UI, fontSize: 12, fontWeight: 600, cursor: "pointer", padding: "8px 14px" }}>Manage</button>
-          : <button onClick={() => openPaywall("Lume Plus")} style={{ border: "none", borderRadius: 18, background: INK, color: "#fff", fontFamily: F_UI, fontSize: 12, fontWeight: 600, cursor: "pointer", padding: "8px 14px" }}>Upgrade</button>}
+        {isAdmin
+          ? <button onClick={() => persist({ ...data, premium: !isPremium })} style={{ border: "1px solid rgba(20,38,61,.15)", borderRadius: 18, background: isPremium ? "rgba(255,255,255,.6)" : INK, color: isPremium ? INK : "#fff", fontFamily: F_UI, fontSize: 12, fontWeight: 600, cursor: "pointer", padding: "8px 14px" }}>{isPremium ? "Admin: off" : "Admin: on"}</button>
+          : isPremium
+            ? <span style={{ fontSize: 11, color: "rgba(20,38,61,.5)" }}>Granted</span>
+            : <button onClick={() => openPaywall("Lume Plus")} style={{ border: "none", borderRadius: 18, background: INK, color: "#fff", fontFamily: F_UI, fontSize: 12, fontWeight: 600, cursor: "pointer", padding: "8px 14px" }}>Upgrade</button>}
       </div>
       <div style={{ ...glass(24), padding: "8px 6px", marginBottom: 14 }}>
         <div style={{ ...eyebrow, padding: "11px 13px 5px" }}>App security</div>
@@ -1974,10 +2052,10 @@ ${rowsHtml}
   const acctOwnerName = editAccount && editAccount !== "new" ? editAccount.owner : null;
 
   return (
-    <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 20, background: "radial-gradient(1000px 700px at 70% 20%,#1D2736 0%,#141A24 60%),#141A24", fontFamily: F_UI }}>
+    <div className="lume-outer" style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 20, background: "radial-gradient(1000px 700px at 70% 20%,#1D2736 0%,#141A24 60%),#141A24", fontFamily: F_UI }}>
       <style>{`@keyframes rise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}@keyframes sheetup{from{transform:translateY(100%)}to{transform:none}}@keyframes fadein{from{opacity:0}to{opacity:1}}.lume-phone ::-webkit-scrollbar{width:0;height:0}.lume-phone input::placeholder,.lume-phone textarea::placeholder{color:rgba(20,38,61,.35)}
       .lume-phone{position:relative;width:402px;height:840px;max-height:94vh;border-radius:44px;overflow:hidden;background:#E9EEF6;color:${INK};box-shadow:0 40px 90px -30px rgba(0,0,0,.7),0 0 0 10px #0c1119,0 0 0 11px rgba(255,255,255,.06)}
-      @media (max-width:520px){body{margin:0}.lume-phone{width:100vw!important;height:100dvh!important;max-height:none!important;border-radius:0!important;box-shadow:none!important}}
+      @media (max-width:520px){html,body{margin:0;padding:0;background:#E9EEF6}.lume-outer{padding:0!important;background:#E9EEF6!important;min-height:100dvh!important}.lume-phone{width:100vw!important;height:100dvh!important;max-height:none!important;border-radius:0!important;box-shadow:none!important}}
       @media (min-width:521px) and (max-width:900px){.lume-phone{width:min(92vw,402px)}}`}</style>
       <div className="lume-phone">
         <div style={{ position: "absolute", inset: 0, background: AMBIENT, pointerEvents: "none" }} />
@@ -1999,7 +2077,8 @@ ${rowsHtml}
           {sheet === "share" && ShareSheet()}
           {sheet === "add" && <ExpenseSheet expense={editExpense} owners={ownerNames} meName={me?.name} data={data} onClose={() => { setSheet(null); setEditExpense(null); }} onSave={saveExpenseRecord} onDelete={deleteExpense} onAddCategory={addCategory} />}
           {sheet === "account" && <AccountSheet account={editAccount} owners={ownerNames} meName={me?.name} existingGroups={[...new Set(data.accounts.filter(a => a.type === "asset" && !GROUP_ORDER.includes(a.group)).map(a => a.group))]} readOnly={acctReadOnly} ownerLabel={acctOwnerName} onClose={() => { setSheet(null); setEditAccount(null); }} onSave={saveAccountRecord} onDelete={deleteAccount} />}
-          {sheet === "paywall" && <PaywallSheet feature={paywallFeature} onClose={() => setSheet(null)} onUpgrade={upgrade} />}
+          {sheet === "legal" && <LegalSheet onClose={() => setSheet(null)} />}
+          {sheet === "paywall" && <PaywallSheet feature={paywallFeature} onClose={() => setSheet(null)} onUpgrade={upgrade} isAdmin={isAdmin} />}
           {sheet === "member" && <MemberSheet member={editMember} me={me} members={members} grants={data.grants || {}} onToggleGrant={toggleGrant} onClose={() => { setSheet(null); setEditMember(null); }} onSave={saveMember} onRemoveFromView={removeMemberFromView} onDeleteFully={deleteMemberFully} />}
         </div>
       </div>
@@ -2212,6 +2291,8 @@ function MemberSheet({ member, me, members, grants, onToggleGrant, onClose, onSa
   const isMe = !adding && member.id === me.id;
   const canEditProfile = adding || isMe || me.role === "owner"; // owners manage the household; everyone manages self
   const [name, setName] = useState(adding ? "" : (member.fullName || member.name));
+  const [inviteMode, setInviteMode] = useState(false);
+  const [inviteEmail, setInviteEmail] = useState(adding ? "" : (member.inviteEmail || ""));
   const [role, setRole] = useState(adding ? "editor" : member.role);
 
   const initials = (name.trim().split(/\s+/).map(w => w[0]).join("").slice(0, 2) || "?").toUpperCase();
@@ -2220,7 +2301,7 @@ function MemberSheet({ member, me, members, grants, onToggleGrant, onClose, onSa
     const finalRole = soleOwner ? "owner" : role; // household must keep at least one owner
     if (adding) {
       const idx = members.length % GRADIENTS._palette.length;
-      onSave({ id: "m_" + uid(), name: name.trim().split(/\s+/)[0] || "Member", fullName: name.trim() || "Member", initials, gradient: GRADIENTS._palette[idx], color: MEMBER_COLOR._palette[idx], role: finalRole, joined: "Just now" });
+      onSave({ id: "m_" + uid(), name: name.trim().split(/\s+/)[0] || "Member", fullName: name.trim() || "Member", initials, gradient: GRADIENTS._palette[idx], color: MEMBER_COLOR._palette[idx], role: finalRole, joined: "Just now", inviteEmail: inviteMode ? inviteEmail.trim() : "" });
     } else {
       onSave({ ...member, name: name.trim().split(/\s+/)[0] || member.name, fullName: name.trim(), role: finalRole });
     }
@@ -2241,6 +2322,20 @@ function MemberSheet({ member, me, members, grants, onToggleGrant, onClose, onSa
       {canEditProfile ? (
         <>
           <div style={{ marginBottom: 12 }}><label style={fieldLabel}>Full name</label><input value={name} onChange={(e) => setName(e.target.value)} placeholder={"e.g. " + (me?.fullName || me?.name || "full name")} style={field} /></div>
+          {adding && (
+            <div style={{ marginBottom: 16 }}>
+              <label style={fieldLabel}>Account type</label>
+              <Chips items={["Offline member", "Invite by email"]} value={inviteMode ? "Invite by email" : "Offline member"} onChange={(v) => setInviteMode(v === "Invite by email")} />
+              {inviteMode ? (
+                <>
+                  <input value={inviteEmail} onChange={(e) => setInviteEmail(e.target.value)} type="email" inputMode="email" placeholder="their@email.com" style={{ ...field, marginTop: 10 }} />
+                  <div style={{ fontSize: 10.5, color: "rgba(20,38,61,.45)", marginTop: 6, lineHeight: 1.5 }}>They'll appear as "Invited" until shared households launch — then they sign in with this email and claim this member, keeping everything you've tracked for them.</div>
+                </>
+              ) : (
+                <div style={{ fontSize: 10.5, color: "rgba(20,38,61,.45)", marginTop: 6, lineHeight: 1.5 }}>You manage this member's entries yourself — right for kids or relatives who won't sign in. Can be converted to an invited account later without losing data.</div>
+              )}
+            </div>
+          )}
           <div style={{ marginBottom: 16 }}><label style={fieldLabel}>Role</label><Seg items={["owner", "editor"]} value={soleOwner ? "owner" : role} onChange={setRole} small /><div style={{ fontSize: 11, color: "rgba(20,38,61,.45)", marginTop: 6 }}>{soleOwner ? "You're the only owner — assign another owner before changing your role." : "Owners manage the household & members. Editors manage their own accounts."}</div></div>
           <button onClick={submit} style={primaryBtn}>{adding ? "Add to household" : "Save profile"}</button>
         </>
@@ -2281,7 +2376,7 @@ function MemberSheet({ member, me, members, grants, onToggleGrant, onClose, onSa
 }
 
 /* ============================ PAYWALL SHEET (placeholder checkout) ============================ */
-function PaywallSheet({ feature, onClose, onUpgrade }) {
+function PaywallSheet({ feature, onClose, onUpgrade, isAdmin }) {
   const [plan, setPlan] = useState("annual");
   const perks = [
     "Wealth projections & FIRE planning",
@@ -2315,11 +2410,39 @@ function PaywallSheet({ feature, onClose, onUpgrade }) {
           </button>
         ); })}
       </div>
-      <button onClick={onUpgrade} style={primaryBtn}>Start 14-day free trial</button>
+      <button onClick={onUpgrade} style={primaryBtn}>{isAdmin ? "Activate (admin)" : "Join the waitlist"}</button>
       <button onClick={onClose} style={{ ...ghostBtn, marginTop: 10 }}>Maybe later</button>
       <div style={{ fontSize: 10.5, color: "rgba(20,38,61,.45)", textAlign: "center", marginTop: 12, lineHeight: 1.5 }}>
-        Demo checkout — this button simply activates Plus locally.<br />Production: Stripe Checkout on web · StoreKit / Play Billing in the wrapped apps.
+        Checkout via Stripe is on the way. Until then, Plus access is granted manually.
       </div>
+    </SheetShell>
+  );
+}
+
+
+/* ============================ TERMS & PRIVACY ============================ */
+function LegalSheet({ onClose }) {
+  const h = { fontSize: 13, fontWeight: 700, margin: "14px 0 4px" };
+  const p = { fontSize: 12, color: "rgba(20,38,61,.7)", lineHeight: 1.6, margin: 0 };
+  return (
+    <SheetShell title="Terms & Privacy" onClose={onClose}>
+      <div style={{ maxHeight: 420, overflowY: "auto", paddingRight: 4 }}>
+        <p style={p}>Last updated: August 2026. By using Lume you agree to the following.</p>
+        <div style={h}>What Lume is — and isn't</div>
+        <p style={p}>Lume is a personal record-keeping and planning tool. Projections, FIRE estimates, property simulations and CPF figures are illustrative estimates based on assumptions you control. They are <b>not financial, legal, tax or investment advice</b>, and no outcome is guaranteed. Consult a licensed adviser before making financial decisions.</p>
+        <div style={h}>Your data</div>
+        <p style={p}>All figures are entered manually by you — Lume never connects to your bank, CPF, brokerage or any institution. Your data is stored on your device and, when signed in, synced to our database (hosted with Supabase in Singapore) so your devices stay consistent. It is protected by row-level security tied to your sign-in and is never sold or shared with third parties.</p>
+        <div style={h}>Your responsibilities</div>
+        <p style={p}>Keep your sign-in method and device secure. Use the backup tools before major changes — you can export your full data at any time from Settings. Deleting your account permanently removes your cloud data and profile.</p>
+        <div style={h}>Personal data (PDPA)</div>
+        <p style={p}>We collect only what the app needs: your sign-in identity (name, email or mobile number) and the financial records you choose to enter. You may access, correct, export or delete your data at any time from within the app. Account deletion is immediate and irreversible.</p>
+        <div style={h}>Liability</div>
+        <p style={p}>Lume is provided "as is", without warranties of any kind. To the maximum extent permitted by law, we are not liable for any loss arising from use of the app, reliance on its estimates, or loss of data. Your sole remedy is to stop using the service and delete your account.</p>
+        <div style={h}>Changes</div>
+        <p style={p}>We may update these terms as the product evolves; continued use constitutes acceptance. Material changes will be flagged in the app.</p>
+        <p style={{ ...p, marginTop: 14, color: "rgba(20,38,61,.45)" }}>Questions or data requests: contact the developer.</p>
+      </div>
+      <button onClick={onClose} style={{ ...primaryBtn, marginTop: 14 }}>Close</button>
     </SheetShell>
   );
 }
