@@ -559,6 +559,12 @@ export default function LumeTracker() {
   const [planOwner, setPlanOwner] = useState("Combined");
   const [showPropCosts, setShowPropCosts] = useState(false);
   const [openOvClass, setOpenOvClass] = useState(null);
+  const [supa, setSupa] = useState(null);          // Supabase client (null = local-only mode)
+  const [session, setSession] = useState(null);    // active auth session
+  const [authReady, setAuthReady] = useState(false);
+  const [signinEmail, setSigninEmail] = useState("");
+  const [authMsg, setAuthMsg] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
   const [showAmort, setShowAmort] = useState(false);
   const [projHover, setProjHover] = useState(null);
   const shareCanvas = useRef(null);
@@ -576,6 +582,46 @@ export default function LumeTracker() {
     return () => { try { document.head.removeChild(l); } catch (e) {} };
   }, []);
   useEffect(() => { const t = setTimeout(() => { try { store.list(BAK_PREFIX, true).then(r => setBackups((r?.keys || []).sort().reverse().slice(0, 8))); } catch (e) {} }, 400); return () => clearTimeout(t); }, []);
+  // Connect to Supabase if configured; otherwise stay in local-only mode
+  useEffect(() => {
+    let sub;
+    (async () => {
+      try {
+        const mod = await import("./lib/supabase.js");
+        const client = mod.supabase;
+        if (client) {
+          setSupa(client);
+          const { data } = await client.auth.getSession();
+          setSession(data?.session || null);
+          sub = client.auth.onAuthStateChange((_e, s) => setSession(s)).data.subscription;
+        }
+      } catch (e) { /* no Supabase configured — local mode */ }
+      setAuthReady(true);
+    })();
+    return () => { try { sub?.unsubscribe(); } catch (e) {} };
+  }, []);
+  // A signed-in session lands you in the app; signing out returns to the sign-in screen
+  useEffect(() => {
+    if (!authReady || !supa) return;
+    if (session && screen === "signin") setScreen("home");
+    if (!session && screen !== "signin") setScreen("signin");
+  }, [session, authReady, supa]);
+  const oauth = async (provider) => {
+    if (!supa) { setScreen("home"); return; }   // local mode: skip auth
+    setAuthBusy(true); setAuthMsg("");
+    const { error } = await supa.auth.signInWithOAuth({ provider, options: { redirectTo: window.location.origin } });
+    if (error) { setAuthMsg(error.message); setAuthBusy(false); }
+  };
+  const emailLink = async () => {
+    if (!supa) { setScreen("home"); return; }
+    const em = signinEmail.trim();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(em)) { setAuthMsg("Enter a valid email address."); return; }
+    setAuthBusy(true); setAuthMsg("");
+    const { error } = await supa.auth.signInWithOtp({ email: em, options: { emailRedirectTo: window.location.origin } });
+    setAuthBusy(false);
+    setAuthMsg(error ? error.message : "Check your inbox — we sent you a sign-in link.");
+  };
+  const signOut = async () => { if (supa) { await supa.auth.signOut(); } setScreen("signin"); };
 
   const pruneBackups = async () => { try { const r = await store.list(BAK_PREFIX, true); const keys = (r?.keys || []).sort().reverse(); for (const k of keys.slice(8)) await store.delete(k, true); } catch (e) {} };
   const persist = async (next) => {
@@ -778,7 +824,7 @@ export default function LumeTracker() {
   const removeDoc = (id) => setLegacy({ docs: L.docs.filter(d => d.id !== id) });
 
   /* ---- shared chrome ---- */
-  const scrollScreen = { position: "relative", height: "100%", overflowY: "auto", padding: "76px 18px 140px", animation: "rise .35s ease-out" };
+  const scrollScreen = { position: "relative", height: "100%", overflowY: "auto", WebkitOverflowScrolling: "touch", boxSizing: "border-box", padding: "76px 18px calc(150px + env(safe-area-inset-bottom))", animation: "rise .35s ease-out" };
   const demoPill = { ...mono(9, 700), letterSpacing: ".08em", padding: "3px 8px", borderRadius: 999, background: "rgba(217,164,65,.2)", color: "#A06E15", flexShrink: 0 };
   const Avatar = () => (
     <button onClick={() => setScreen("settings")} style={{ width: 40, height: 40, borderRadius: 20, border: "1px solid rgba(255,255,255,.7)", background: me?.gradient || GRADIENTS._palette[0], cursor: "pointer", color: "#fff", fontWeight: 700, fontSize: 14, boxShadow: "inset 0 1px 0 rgba(255,255,255,.5)", flexShrink: 0 }}>{me?.initials || "?"}</button>
@@ -798,24 +844,34 @@ export default function LumeTracker() {
 
   /* ============================ SCREENS ============================ */
   const SignIn = () => (
-    <div style={{ position: "relative", height: "100%", display: "flex", flexDirection: "column", padding: "56px 24px 32px", overflowY: "auto", animation: "fadein .4s" }}>
+    <div style={{ position: "relative", height: "100%", overflowY: "auto", WebkitOverflowScrolling: "touch", animation: "fadein .4s" }}>
+      <div style={{ minHeight: "100%", display: "flex", flexDirection: "column", justifyContent: "space-between", gap: 24, padding: "48px 24px calc(28px + env(safe-area-inset-bottom))", boxSizing: "border-box" }}>
       <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 16, marginTop: 24 }}>
         <div style={{ width: 74, height: 74, borderRadius: 24, ...glass(24, 24), display: "flex", alignItems: "center", justifyContent: "center", boxShadow: "0 18px 36px -16px rgba(23,42,72,.35), inset 0 1px 0 rgba(255,255,255,.85)" }}>
           <div style={{ width: 40, height: 40, borderRadius: 13, background: "linear-gradient(135deg,#5DC4CB,#8A7FD4)", boxShadow: "inset 0 1px 0 rgba(255,255,255,.6)", display: "flex", alignItems: "center", justifyContent: "center" }}><span style={{ fontWeight: 700, fontSize: 20, color: "#fff" }}>L</span></div>
         </div>
         <div style={{ textAlign: "center" }}><div style={{ fontSize: 32, fontWeight: 700, letterSpacing: "-.02em" }}>Lume</div><div style={{ fontSize: 15, color: "rgba(20,38,61,.6)", marginTop: 6, lineHeight: 1.5, maxWidth: 270 }}>See your whole financial picture — cash, CPF, property and spending — in one calm place.</div></div>
       </div>
-      <div style={{ marginTop: "auto", paddingTop: 28, display: "flex", flexDirection: "column", gap: 10, flexShrink: 0 }}>
-        <button onClick={() => setScreen("home")} style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, height: 52, border: "none", borderRadius: 26, background: INK, color: "#fff", fontFamily: F_UI, fontSize: 15.5, fontWeight: 600, cursor: "pointer", boxShadow: "0 14px 26px -12px rgba(20,38,61,.5)" }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 10, flexShrink: 0 }}>
+        <button disabled={authBusy} onClick={() => oauth("google")} style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, height: 52, border: "none", borderRadius: 26, background: INK, color: "#fff", fontFamily: F_UI, fontSize: 15.5, fontWeight: 600, cursor: authBusy ? "wait" : "pointer", opacity: authBusy ? .6 : 1, boxShadow: "0 14px 26px -12px rgba(20,38,61,.5)" }}>
           <svg width="17" height="17" viewBox="0 0 24 24"><path fill="#fff" d="M21.35 11.1H12v3.7h5.4c-.5 2.4-2.6 3.9-5.4 3.9a6.7 6.7 0 1 1 0-13.4c1.7 0 3.2.6 4.3 1.7l2.7-2.7A10.4 10.4 0 1 0 12 22.4c6 0 10-4.2 10-10.1 0-.4 0-.8-.1-1.2Z" /></svg>Continue with Google
         </button>
-        <button onClick={() => setScreen("home")} style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, height: 52, border: "none", borderRadius: 26, background: "#000", color: "#fff", fontFamily: F_UI, fontSize: 15.5, fontWeight: 600, cursor: "pointer", boxShadow: "0 14px 26px -12px rgba(0,0,0,.5)" }}>
+        <button disabled={authBusy} onClick={() => oauth("apple")} style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, height: 52, border: "none", borderRadius: 26, background: "#000", color: "#fff", fontFamily: F_UI, fontSize: 15.5, fontWeight: 600, cursor: authBusy ? "wait" : "pointer", opacity: authBusy ? .6 : 1, boxShadow: "0 14px 26px -12px rgba(0,0,0,.5)" }}>
           <svg width="16" height="18" viewBox="0 0 24 24" fill="#fff"><path d="M17.05 12.04c-.03-2.6 2.13-3.85 2.22-3.91-1.21-1.77-3.09-2.01-3.76-2.04-1.6-.16-3.12.94-3.93.94-.81 0-2.06-.92-3.39-.9-1.74.03-3.35 1.01-4.25 2.57-1.81 3.15-.46 7.82 1.3 10.38.86 1.25 1.89 2.66 3.23 2.61 1.3-.05 1.79-.84 3.36-.84 1.57 0 2.01.84 3.39.81 1.4-.02 2.29-1.28 3.15-2.54.99-1.46 1.4-2.87 1.42-2.94-.03-.01-2.72-1.05-2.75-4.15M14.53 4.4c.72-.87 1.2-2.08 1.07-3.28-1.03.04-2.28.69-3.02 1.55-.66.77-1.24 2-1.08 3.18 1.15.09 2.33-.59 3.03-1.45"/></svg> Continue with Apple
         </button>
-        <button onClick={() => setScreen("home")} style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, height: 52, ...glass(26, 20, 0.55), color: INK, fontFamily: F_UI, fontSize: 15.5, fontWeight: 600, cursor: "pointer" }}>
-          <Ico as={Mail} size={17} color="rgba(20,38,61,.7)" /> Continue with email
-        </button>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 7, marginTop: 8, color: "rgba(20,38,61,.5)", fontSize: 11.5 }}><Ico as={Lock} size={13} color="rgba(20,38,61,.5)" /> Manual entry only — Lume never links to your bank.</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "2px 0" }}>
+          <span style={{ flex: 1, height: 1, background: "rgba(20,38,61,.12)" }} /><span style={{ fontSize: 11, color: "rgba(20,38,61,.4)" }}>or</span><span style={{ flex: 1, height: 1, background: "rgba(20,38,61,.12)" }} />
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input value={signinEmail} onChange={(e) => setSigninEmail(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") emailLink(); }} type="email" inputMode="email" autoComplete="email" placeholder="you@email.com" style={{ flex: 1, minWidth: 0, height: 52, borderRadius: 26, border: "1px solid rgba(255,255,255,.75)", background: "rgba(255,255,255,.6)", padding: "0 18px", fontFamily: F_UI, fontSize: 15, color: INK, outline: "none" }} />
+          <button disabled={authBusy} onClick={emailLink} title="Email me a sign-in link" style={{ width: 52, height: 52, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", borderRadius: 26, border: "none", ...glass(26, 20, 0.55), cursor: authBusy ? "wait" : "pointer", opacity: authBusy ? .6 : 1 }}>
+            <Ico as={Mail} size={18} color={INK} />
+          </button>
+        </div>
+        {authMsg && <div style={{ fontSize: 12, color: authMsg.startsWith("Check") ? POS : NEG, textAlign: "center", lineHeight: 1.5, padding: "0 4px" }}>{authMsg}</div>}
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 7, marginTop: 4, color: "rgba(20,38,61,.5)", fontSize: 11.5, textAlign: "center", lineHeight: 1.5 }}><Ico as={Lock} size={13} color="rgba(20,38,61,.5)" /> Manual entry only — Lume never links to your bank.</div>
+        {authReady && !supa && <div style={{ fontSize: 10.5, color: "rgba(20,38,61,.4)", textAlign: "center" }}>Local mode — data stays on this device. Tap any button to continue.</div>}
+      </div>
       </div>
     </div>
   );
@@ -1146,6 +1202,7 @@ export default function LumeTracker() {
     { label: "Clear all data", sub: "Erase everything, keep your profile", icon: EyeOff, color: NEG, onClick: clearAllData },
     { label: "Delete account & data", sub: "Permanent · double-confirmed", icon: Trash2, color: NEG, onClick: deleteAccountFully },
   ];
+  const sessionEmail = session?.user?.email || null;
   const SettingsScreen = () => (
     <div style={scrollScreen}>
       <Header over={(me?.fullName || me?.name || "You") + " · " + (me?.name || "you").toLowerCase() + "@lume.app"} title="Security & privacy" back />
@@ -1178,6 +1235,14 @@ export default function LumeTracker() {
             <Ico as={ChevronRight} size={15} color="rgba(20,38,61,.3)" />
           </button>
         ))}
+      </div>
+      <div style={{ ...glass(20, 18, 0.4), padding: "12px 14px", marginBottom: 14, display: "flex", alignItems: "center", gap: 11 }}>
+        <Ico as={ScanFace} size={17} color="rgba(20,38,61,.55)" />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 12.5, fontWeight: 600 }}>{sessionEmail ? "Signed in" : supa ? "Not signed in" : "Local mode"}</div>
+          <div style={{ fontSize: 11, color: "rgba(20,38,61,.5)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{sessionEmail || (supa ? "Sign in to sync across devices" : "Data stays on this device")}</div>
+        </div>
+        {sessionEmail && <button onClick={signOut} style={{ border: "1px solid rgba(20,38,61,.15)", borderRadius: 18, background: "rgba(255,255,255,.6)", color: INK, fontFamily: F_UI, fontSize: 12, fontWeight: 600, cursor: "pointer", padding: "8px 14px", flexShrink: 0 }}>Sign out</button>}
       </div>
       <div style={{ ...glass(24), padding: "8px 6px", marginBottom: 14 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "11px 13px 5px" }}>
@@ -1728,7 +1793,7 @@ ${rowsHtml}
 
   const tabs = [{ label: "Home", k: "home", icon: Home }, { label: "Spend", k: "expenses", icon: Receipt }, { label: "Wealth", k: "wealth", icon: PieChart }, { label: "Plan", k: "plan", icon: TrendingUp }, { label: "Family", k: "household", icon: Users }];
   const Dock = () => (
-    <div style={{ position: "absolute", left: 12, right: 12, bottom: 20, zIndex: 30, display: "flex", alignItems: "center", gap: 8 }}>
+    <div style={{ position: "absolute", left: 12, right: 12, bottom: "calc(20px + env(safe-area-inset-bottom))", zIndex: 30, display: "flex", alignItems: "center", gap: 8 }}>
       <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "space-around", height: 62, borderRadius: 31, background: "rgba(255,255,255,.55)", backdropFilter: "blur(28px) saturate(1.9)", WebkitBackdropFilter: "blur(28px) saturate(1.9)", border: "1px solid rgba(255,255,255,.75)", boxShadow: "0 18px 38px -14px rgba(23,42,72,.4), inset 0 1px 0 rgba(255,255,255,.9)", padding: "0 4px" }}>
         {tabs.map((t) => { const on = screen === t.k; return (
           <button key={t.k} onClick={() => { setScreen(t.k); setSheet(null); }} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2, border: "none", background: on ? "rgba(20,38,61,.08)" : "transparent", cursor: "pointer", padding: "7px 9px", borderRadius: 18, fontFamily: F_UI }}>
@@ -1800,7 +1865,7 @@ function SheetShell({ title, onClose, children }) {
   return (
     <div style={{ position: "absolute", inset: 0, zIndex: 40, display: "flex", flexDirection: "column", justifyContent: "flex-end" }}>
       <div onClick={onClose} style={{ position: "absolute", inset: 0, background: "rgba(20,30,45,.35)", backdropFilter: "blur(6px)", WebkitBackdropFilter: "blur(6px)", animation: "fadein .25s" }} />
-      <div style={{ position: "relative", maxHeight: "88%", overflowY: "auto", borderRadius: "32px 32px 0 0", background: "rgba(248,250,253,.9)", backdropFilter: "blur(34px) saturate(1.9)", WebkitBackdropFilter: "blur(34px) saturate(1.9)", border: "1px solid rgba(255,255,255,.8)", boxShadow: "0 -20px 50px rgba(15,25,40,.3)", padding: "14px 20px 34px", animation: "sheetup .32s cubic-bezier(.22,.68,.32,1)" }}>
+      <div style={{ position: "relative", maxHeight: "88%", overflowY: "auto", borderRadius: "32px 32px 0 0", background: "rgba(248,250,253,.9)", backdropFilter: "blur(34px) saturate(1.9)", WebkitBackdropFilter: "blur(34px) saturate(1.9)", border: "1px solid rgba(255,255,255,.8)", boxShadow: "0 -20px 50px rgba(15,25,40,.3)", padding: "14px 20px calc(34px + env(safe-area-inset-bottom))", animation: "sheetup .32s cubic-bezier(.22,.68,.32,1)" }}>
         <div style={{ width: 40, height: 5, borderRadius: 3, background: "rgba(20,38,61,.15)", margin: "0 auto 14px" }} />
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}><span style={{ fontSize: 17, fontWeight: 700 }}>{title}</span><button onClick={onClose} style={{ width: 32, height: 32, borderRadius: 16, border: "none", background: "rgba(20,38,61,.07)", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}><Ico as={X} size={14} color="rgba(20,38,61,.55)" /></button></div>
         {children}
