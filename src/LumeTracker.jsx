@@ -230,6 +230,7 @@ function migrate(d) {
     budget: typeof d.budget === "number" ? d.budget : SEED.budget,
     premium: !!d.premium,
     demo: !!d.demo,
+    activityHidden: Array.isArray(d.activityHidden) ? d.activityHidden : [],
     scenarioB: d.scenarioB || null,
     propertySim: { ...DEFAULT_PROP, ...(d.propertySim || {}) },
     cpfPlan: { monthlyContrib: 3700, ...(d.cpfPlan || {}) },
@@ -257,10 +258,27 @@ function downloadBlob(content, type, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
 // A fresh household: keeps only the acting user, wipes all financial data
+// Build a first member from the signed-in identity (Google name/avatar or email)
+function memberFromSession(session) {
+  const u = session?.user;
+  const meta = u?.user_metadata || {};
+  const full = (meta.full_name || meta.name || "").trim();
+  const email = u?.email || "";
+  const fallback = email ? email.split("@")[0] : "You";
+  const fullName = full || fallback;
+  const first = fullName.split(/\s+/)[0] || "You";
+  const initials = (first[0] || "?").toUpperCase();
+  return {
+    id: u?.id ? "m_" + u.id.slice(0, 8) : "m_me",
+    name: first, fullName, initials,
+    gradient: GRADIENTS._palette[0], color: MEMBER_COLOR._palette[0],
+    role: "owner", joined: "Just now", email,
+  };
+}
 function emptyData(me) {
   const keep = me || SEED.members[0];
   return {
-    budget: 20000, premium: false, demo: false,
+    budget: 20000, premium: false, demo: false, activityHidden: [],
     currentUserId: keep.id,
     members: [{ ...keep, role: "owner" }],
     grants: {}, hidden: {},
@@ -574,13 +592,27 @@ export default function LumeTracker() {
     const l = document.createElement("link"); l.rel = "stylesheet";
     l.href = "https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap";
     document.head.appendChild(l);
-    (async () => {
-      try { const r = await store.get("lume-data-v1", true); if (r && r.value) { setData(migrate(JSON.parse(r.value))); return; } } catch (e) {}
-      setData(SEED);
-      try { await store.set("lume-data-v1", JSON.stringify(SEED), true); } catch (e) {}
-    })();
     return () => { try { document.head.removeChild(l); } catch (e) {} };
   }, []);
+  // Load this user's data once auth has settled. Each signed-in account gets its
+  // own namespaced store, and a brand-new account starts on a clean slate.
+  useEffect(() => {
+    if (!authReady) return;
+    let cancelled = false;
+    (async () => {
+      const key = session?.user?.id ? "lume-u-" + session.user.id : "lume-data-v1";
+      try {
+        const r = await store.get(key, true);
+        if (!cancelled && r && r.value) { setData(migrate(JSON.parse(r.value))); return; }
+      } catch (e) {}
+      if (cancelled) return;
+      const first = session ? memberFromSession(session) : { id: "m_me", name: "You", fullName: "You", initials: "Y", gradient: GRADIENTS._palette[0], color: MEMBER_COLOR._palette[0], role: "owner", joined: "Just now" };
+      const fresh = migrate(emptyData(first));
+      setData(fresh);
+      try { await store.set(key, JSON.stringify(fresh), true); } catch (e) {}
+    })();
+    return () => { cancelled = true; };
+  }, [authReady, session?.user?.id]);
   useEffect(() => { const t = setTimeout(() => { try { store.list(BAK_PREFIX, true).then(r => setBackups((r?.keys || []).sort().reverse().slice(0, 8))); } catch (e) {} }, 400); return () => clearTimeout(t); }, []);
   // Connect to Supabase if configured; otherwise stay in local-only mode
   useEffect(() => {
@@ -623,11 +655,12 @@ export default function LumeTracker() {
   };
   const signOut = async () => { if (supa) { await supa.auth.signOut(); } setScreen("signin"); };
 
+  const dataKey = session?.user?.id ? "lume-u-" + session.user.id : "lume-data-v1";
   const pruneBackups = async () => { try { const r = await store.list(BAK_PREFIX, true); const keys = (r?.keys || []).sort().reverse(); for (const k of keys.slice(8)) await store.delete(k, true); } catch (e) {} };
   const persist = async (next) => {
     setData(next);
     try {
-      await store.set("lume-data-v1", JSON.stringify(next), true);
+      await store.set(dataKey, JSON.stringify(next), true);
       // rolling automatic backup: one snapshot per day, keep the last 8 backups
       await store.set(BAK_PREFIX + "auto-" + new Date().toISOString().slice(0, 10), JSON.stringify(next), true);
       pruneBackups();
@@ -1057,22 +1090,29 @@ export default function LumeTracker() {
 
   const visibleMembers = members.filter(m => m.id === me?.id || !hiddenForMe.includes(m.id));
   const memberNet = (m) => ownerNet(m.name);
+  const actHidden = data.activityHidden || [];
   const activity = (() => {
     const memberByNameLocal = (n) => members.find(m => m.name === n);
     const av = (n) => { const m = memberByNameLocal(n); return { initial: m?.initials || (n === JOINT ? "J" : "?"), avatarBg: m?.gradient || "linear-gradient(135deg,#94A7BE,#6E8299)" }; };
     const items = [];
     (data.expenses || []).forEach((e) => {
-      items.push({ ...av(e.owner), sort: e.date || "", text: `${e.owner} ${e.dir === "in" ? "logged income" : "logged"} ${e.name} — ${CUR_SYM[e.currency] || ""}${Math.round(e.amount).toLocaleString()}${e.category ? " (" + e.category + ")" : ""}`, when: e.date || "" });
+      items.push({ id: "e:" + e.id, ...av(e.owner), sort: e.date || "", text: `${e.owner} ${e.dir === "in" ? "logged income" : "logged"} ${e.name} — ${CUR_SYM[e.currency] || ""}${Math.round(e.amount).toLocaleString()}${e.category ? " (" + e.category + ")" : ""}`, when: e.date || "" });
     });
     (data.accounts || []).forEach((a) => {
       const h = a.history || [];
       if (h.length < 2) return;
       const last = h[h.length - 1], prev = h[h.length - 2];
       if (!last || last.balance === prev.balance) return;
-      items.push({ ...av(a.owner), sort: last.date || "", text: `${a.owner} updated ${a.name} — ${last.balance > prev.balance ? "up" : "down"} ${fmt(Math.abs(last.balance - prev.balance))}`, when: last.date || "" });
+      items.push({ id: "a:" + a.id + ":" + (last.date || ""), ...av(a.owner), sort: last.date || "", text: `${a.owner} updated ${a.name} — ${last.balance > prev.balance ? "up" : "down"} ${fmt(Math.abs(last.balance - prev.balance))}`, when: last.date || "" });
     });
-    return items.sort((x, y) => (y.sort || "").localeCompare(x.sort || "")).slice(0, 6);
+    return items.filter((i) => !actHidden.includes(i.id)).sort((x, y) => (y.sort || "").localeCompare(x.sort || "")).slice(0, 8);
   })();
+  const hideActivity = (id) => persist({ ...data, activityHidden: [...actHidden, id] });
+  const clearActivity = () => {
+    if (!confirm("Clear the activity feed? Your transactions and balances are not deleted — only these entries are hidden.")) return;
+    persist({ ...data, activityHidden: [...new Set([...actHidden, ...activity.map((i) => i.id)])] });
+  };
+  const restoreActivity = () => persist({ ...data, activityHidden: [] });
   const netMembers = visibleMembers.map(m => ({ m, net: memberNet(m) }));
   const netSum = netMembers.reduce((s, x) => s + Math.max(0, x.net), 0) || 1;
   const hhSelected = hhView === "household" ? null : visibleMembers.find(m => m.id === hhView);
@@ -1142,14 +1182,19 @@ export default function LumeTracker() {
         <Ico as={ChevronRight} size={16} color="rgba(20,38,61,.35)" />
       </button>
       <div style={{ ...glass(24), padding: "8px 6px", marginBottom: 14 }}>
-        <div style={{ ...eyebrow, padding: "11px 13px 5px" }}>Activity</div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "11px 13px 5px" }}>
+          <span style={eyebrow}>Activity</span>
+          {activity.length > 0 && <button onClick={clearActivity} style={{ border: "none", background: "none", color: ACCENT, fontFamily: F_UI, fontSize: 11.5, fontWeight: 600, cursor: "pointer", padding: 0 }}>Clear all</button>}
+          {activity.length === 0 && actHidden.length > 0 && <button onClick={restoreActivity} style={{ border: "none", background: "none", color: ACCENT, fontFamily: F_UI, fontSize: 11.5, fontWeight: 600, cursor: "pointer", padding: 0 }}>Restore hidden</button>}
+        </div>
         {activity.length === 0 && (
-          <div style={{ fontSize: 12, color: "rgba(20,38,61,.5)", padding: "6px 13px 12px", lineHeight: 1.5 }}>No activity yet — logging a transaction or updating a balance will show up here.</div>
+          <div style={{ fontSize: 12, color: "rgba(20,38,61,.5)", padding: "6px 13px 12px", lineHeight: 1.5 }}>{actHidden.length > 0 ? "Activity feed cleared. Your transactions and balances are untouched." : "No activity yet — logging a transaction or updating a balance will show up here."}</div>
         )}
-        {activity.map((a, i) => (
-          <div key={i} style={{ display: "flex", gap: 11, padding: "9px 13px", alignItems: "flex-start" }}>
+        {activity.map((a) => (
+          <div key={a.id} style={{ display: "flex", gap: 11, padding: "9px 13px", alignItems: "flex-start" }}>
             <div style={{ width: 26, height: 26, borderRadius: 13, background: a.avatarBg, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontWeight: 700, fontSize: 10, flexShrink: 0, marginTop: 1 }}>{a.initial}</div>
-            <div style={{ minWidth: 0 }}><div style={{ fontSize: 12.5, lineHeight: 1.45, color: "rgba(20,38,61,.8)" }}>{a.text}</div><div style={{ fontSize: 10.5, color: "rgba(20,38,61,.4)", marginTop: 2 }}>{a.when}</div></div>
+            <div style={{ minWidth: 0, flex: 1 }}><div style={{ fontSize: 12.5, lineHeight: 1.45, color: "rgba(20,38,61,.8)" }}>{a.text}</div><div style={{ fontSize: 10.5, color: "rgba(20,38,61,.4)", marginTop: 2 }}>{a.when}</div></div>
+            <button onClick={() => hideActivity(a.id)} title="Remove from activity" style={{ width: 24, height: 24, borderRadius: 12, border: "none", background: "rgba(20,38,61,.06)", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: 1 }}><Ico as={X} size={11} color="rgba(20,38,61,.45)" /></button>
           </div>
         ))}
       </div>
@@ -1247,7 +1292,18 @@ export default function LumeTracker() {
       <div style={{ ...glass(24), padding: "8px 6px", marginBottom: 14 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "11px 13px 5px" }}>
           <span style={eyebrow}>Backups</span>
-          <button onClick={() => writeBackup("manual", true)} style={{ display: "flex", alignItems: "center", gap: 5, border: "none", background: "none", color: ACCENT, fontFamily: F_UI, fontSize: 12, fontWeight: 600, cursor: "pointer", padding: 0 }}><Ico as={Download} size={13} color={ACCENT} />Back up now</button>
+          <div style={{ display: "flex", gap: 12 }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 5, color: ACCENT, fontFamily: F_UI, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+              <Ico as={ImageDown} size={13} color={ACCENT} />Import
+              <input type="file" accept="application/json,.json" style={{ display: "none" }} onChange={(e) => {
+                const f = e.target.files && e.target.files[0]; if (!f) return;
+                const rd = new FileReader();
+                rd.onload = () => { try { const parsed = JSON.parse(String(rd.result)); if (!parsed || !Array.isArray(parsed.accounts)) throw new Error("bad"); if (confirm("Import this backup? It replaces the data in this account.")) persist(migrate(parsed)); } catch (err) { alert("That file doesn't look like a Lume backup."); } };
+                rd.readAsText(f); e.target.value = "";
+              }} />
+            </label>
+            <button onClick={() => writeBackup("manual", true)} style={{ display: "flex", alignItems: "center", gap: 5, border: "none", background: "none", color: ACCENT, fontFamily: F_UI, fontSize: 12, fontWeight: 600, cursor: "pointer", padding: 0 }}><Ico as={Download} size={13} color={ACCENT} />Back up now</button>
+          </div>
         </div>
         {backups.length === 0 && <div style={{ fontSize: 12, color: "rgba(20,38,61,.5)", padding: "6px 13px 10px" }}>No stored backups yet — a snapshot is saved automatically each day you use Lume.</div>}
         {backups.map((k) => (
