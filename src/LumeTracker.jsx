@@ -175,39 +175,6 @@ const TRENDS = {
 };
 const SPEND_TREND = [17.9, 18.6, 19.1, 18.8, 19.4, 19.6];
 
-/* Generic sample household — clearly marked as DEMO throughout the UI */
-const DEMO = {
-  budget: 8000, premium: false, demo: true,
-  currentUserId: "d_alex",
-  members: [
-    { id: "d_alex", name: "Alex", fullName: "Alex Tan", initials: "A", gradient: GRADIENTS._palette[2], color: MEMBER_COLOR._palette[2], role: "owner", joined: "Demo" },
-    { id: "d_sam", name: "Sam", fullName: "Sam Lee", initials: "S", gradient: GRADIENTS._palette[4], color: MEMBER_COLOR._palette[4], role: "editor", joined: "Demo" },
-  ],
-  grants: {}, hidden: {},
-  planning: { annualExpenses: 60000, swr: 4, returnRate: 5, inflation: 2.5, monthlyInvest: 2000, retireAge: 62, currentAge: 35, mode: "base", classRates: null, rateMode: "mixed" },
-  legacy: { executor: "", willLocation: "", lawyer: "", checklist: {}, docs: [] },
-  categories: SEED.categories.map(c => ({ ...c })),
-  accounts: [
-    acc("da1", "asset", "Cash", "Savings account", "Bank savings · Alex", 50000, "SGD", "Alex", { h0: 48000 }),
-    acc("da2", "asset", "Cash", "Savings account", "Bank savings · Sam", 40000, "SGD", "Sam", { h0: 39000 }),
-    acc("da3", "asset", "Cash", "Joint account", "Shared expenses", 20000, "SGD", "Joint", { h0: 19000 }),
-    acc("da4", "asset", "CPF", "CPF — Alex", "OA + SA + MA", 100000, "SGD", "Alex", { h0: 97000 }),
-    acc("da5", "asset", "CPF", "CPF — Sam", "OA + SA + MA", 80000, "SGD", "Sam", { h0: 78000 }),
-    acc("da6", "asset", "Investments", "Index fund portfolio", "Broad market ETFs", 120000, "SGD", "Alex", { h0: 112000 }),
-    acc("da7", "asset", "Property", "HDB flat", "4-room · est. value", 650000, "SGD", "Joint", { h0: 640000 }),
-    acc("da8", "liability", "Liabilities", "HDB loan", "Home loan · joint", 350000, "SGD", "Joint", { rate: "2.60%", h0: 354000 }),
-  ],
-  expenses: [
-    { id: "de1", name: "Salary — Alex", category: "Income", amount: 6000, currency: "SGD", owner: "Alex", date: TODAY, notes: "", dir: "in", recurring: { interval: "monthly", every: 1, endDate: "" } },
-    { id: "de2", name: "Salary — Sam", category: "Income", amount: 5000, currency: "SGD", owner: "Sam", date: TODAY, notes: "", dir: "in", recurring: { interval: "monthly", every: 1, endDate: "" } },
-    { id: "de3", name: "HDB loan payment", category: "Mortgage", amount: 1600, currency: "SGD", owner: "Joint", date: TODAY, notes: "", dir: "out", recurring: { interval: "monthly", every: 1, endDate: "" } },
-    { id: "de4", name: "Groceries", category: "Groceries", amount: 600, currency: "SGD", owner: "Joint", date: TODAY, notes: "", dir: "out", recurring: null },
-    { id: "de5", name: "Utilities & telco", category: "Utilities", amount: 250, currency: "SGD", owner: "Joint", date: TODAY, notes: "", dir: "out", recurring: { interval: "monthly", every: 1, endDate: "" } },
-    { id: "de6", name: "Transport", category: "Transport", amount: 300, currency: "SGD", owner: "Alex", date: TODAY, notes: "", dir: "out", recurring: null },
-    { id: "de7", name: "Insurance premiums", category: "Insurance", amount: 400, currency: "SGD", owner: "Sam", date: TODAY, notes: "", dir: "out", recurring: { interval: "monthly", every: 1, endDate: "" } },
-  ],
-};
-
 /* Backfill any keys missing from older saved data so the app never reads undefined */
 function migrate(d) {
   if (!d || typeof d !== "object") return SEED;
@@ -215,8 +182,8 @@ function migrate(d) {
     ...SEED, ...d,
     planning: { ...SEED.planning, ...(d.planning || {}) },
     legacy: { ...SEED.legacy, ...(d.legacy || {}), checklist: { ...SEED.legacy.checklist, ...((d.legacy || {}).checklist || {}) }, docs: (d.legacy && Array.isArray(d.legacy.docs)) ? d.legacy.docs : SEED.legacy.docs },
-    members: Array.isArray(d.members) && d.members.length ? d.members : SEED.members,
-    currentUserId: d.currentUserId || SEED.currentUserId,
+    members: Array.isArray(d.members) ? d.members : [],
+    currentUserId: d.currentUserId || (Array.isArray(d.members) && d.members[0] ? d.members[0].id : null),
     grants: d.grants || {},
     hidden: d.hidden || {},
     categories: (() => {
@@ -231,6 +198,7 @@ function migrate(d) {
     premium: !!d.premium,
     demo: !!d.demo,
     activityHidden: Array.isArray(d.activityHidden) ? d.activityHidden : [],
+    security: { faceId: false, autoLock: true, autoLockSecs: 300, credId: null, ...(d.security || {}) },
     scenarioB: d.scenarioB || null,
     propertySim: { ...DEFAULT_PROP, ...(d.propertySim || {}) },
     cpfPlan: { monthlyContrib: 3700, ...(d.cpfPlan || {}) },
@@ -279,6 +247,7 @@ function emptyData(me) {
   const keep = me || SEED.members[0];
   return {
     budget: 20000, premium: false, demo: false, activityHidden: [],
+    security: { faceId: false, autoLock: true, autoLockSecs: 300, credId: null },
     currentUserId: keep.id,
     members: [{ ...keep, role: "owner" }],
     grants: {}, hidden: {},
@@ -568,7 +537,13 @@ export default function LumeTracker() {
   const [saved, setSaved] = useState(false);
   const [hhView, setHhView] = useState("household");
   const [wealthOwner, setWealthOwner] = useState("All");
-  const [sec, setSec] = useState({ faceId: true, appLock: true, privLaunch: false, hideSwitcher: true });
+  const [privLaunch, setPrivLaunch] = useState(false); // open-in-privacy toggle (session only)
+  const [locked, setLocked] = useState(false);
+  const [syncStatus, setSyncStatus] = useState("local"); // local | syncing | synced | offline
+  const syncTimer = useRef(null);
+  const lastPushRef = useRef(0);
+  const hiddenAtRef = useRef(null);
+  const initLockRef = useRef(false);
   const [editExpense, setEditExpense] = useState(null); // expense object or "new"
   const [editAccount, setEditAccount] = useState(null); // account object or "new"
   const [editMember, setEditMember] = useState(null);   // member object or "new"
@@ -600,20 +575,65 @@ export default function LumeTracker() {
     if (!authReady) return;
     let cancelled = false;
     (async () => {
-      const key = session?.user?.id ? "lume-u-" + session.user.id : "lume-data-v1";
+      const uid = session?.user?.id;
+      const key = uid ? "lume-u-" + uid : "lume-data-v1";
+      // 1) cloud copy wins — it's the shared source of truth across devices
+      if (uid && supa) {
+        try {
+          const { data: row } = await supa.from("app_state").select("data").eq("user_id", uid).maybeSingle();
+          if (!cancelled && row && row.data) {
+            const d = migrate(row.data); setData(d); setSyncStatus("synced");
+            try { await store.set(key, JSON.stringify(d), true); } catch (e) {}
+            return;
+          }
+        } catch (e) {}
+      }
+      if (cancelled) return;
+      // 2) local copy — push it up so other devices see it
       try {
         const r = await store.get(key, true);
-        if (!cancelled && r && r.value) { setData(migrate(JSON.parse(r.value))); return; }
+        if (!cancelled && r && r.value) { const d = migrate(JSON.parse(r.value)); setData(d); if (uid) pushCloud(d); return; }
       } catch (e) {}
       if (cancelled) return;
+      // 3) brand-new account: clean slate from the auth identity
       const first = session ? memberFromSession(session) : { id: "m_me", name: "You", fullName: "You", initials: "Y", gradient: GRADIENTS._palette[0], color: MEMBER_COLOR._palette[0], role: "owner", joined: "Just now" };
       const fresh = migrate(emptyData(first));
       setData(fresh);
       try { await store.set(key, JSON.stringify(fresh), true); } catch (e) {}
+      if (uid) pushCloud(fresh);
     })();
     return () => { cancelled = true; };
-  }, [authReady, session?.user?.id]);
-  useEffect(() => { const t = setTimeout(() => { try { store.list(BAK_PREFIX, true).then(r => setBackups((r?.keys || []).sort().reverse().slice(0, 8))); } catch (e) {} }, 400); return () => clearTimeout(t); }, []);
+  }, [authReady, session?.user?.id, supa]);
+  // Live sync: apply changes made on another device
+  useEffect(() => {
+    if (!supa || !session?.user?.id) return;
+    const uid = session.user.id;
+    const ch = supa.channel("lume-state-" + uid)
+      .on("postgres_changes", { event: "*", schema: "public", table: "app_state", filter: "user_id=eq." + uid }, (payload) => {
+        if (Date.now() - lastPushRef.current < 2500) return; // ignore our own write echo
+        if (payload.new && payload.new.data) setData(migrate(payload.new.data));
+      })
+      .subscribe();
+    return () => { try { supa.removeChannel(ch); } catch (e) {} };
+  }, [supa, session?.user?.id]);
+  // Biometric lock: lock once on first load if enabled, and on return after the auto-lock window
+  useEffect(() => {
+    if (!data || initLockRef.current) return;
+    initLockRef.current = true;
+    const s = data.security || {};
+    if (s.faceId && s.credId) setLocked(true);
+    if (privLaunch) setPrivacy(true);
+  }, [data]);
+  useEffect(() => {
+    const onVis = () => {
+      const s = (data && data.security) || {};
+      if (document.visibilityState === "hidden") { hiddenAtRef.current = Date.now(); }
+      else if (s.faceId && s.credId && s.autoLock && hiddenAtRef.current && Date.now() - hiddenAtRef.current >= (s.autoLockSecs || 300) * 1000) setLocked(true);
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [data]);
+  useEffect(() => { if (!authReady) return; const t = setTimeout(() => { try { store.list(bakPrefix, true).then(r => setBackups((r?.keys || []).sort().reverse().slice(0, 8))); } catch (e) {} }, 400); return () => clearTimeout(t); }, [authReady, session?.user?.id]);
   // Connect to Supabase if configured; otherwise stay in local-only mode
   useEffect(() => {
     let sub;
@@ -656,23 +676,35 @@ export default function LumeTracker() {
   const signOut = async () => { if (supa) { await supa.auth.signOut(); } setScreen("signin"); };
 
   const dataKey = session?.user?.id ? "lume-u-" + session.user.id : "lume-data-v1";
-  const pruneBackups = async () => { try { const r = await store.list(BAK_PREFIX, true); const keys = (r?.keys || []).sort().reverse(); for (const k of keys.slice(8)) await store.delete(k, true); } catch (e) {} };
+  const bakPrefix = session?.user?.id ? "lume-bak-" + session.user.id.slice(0, 8) + "-" : "lume-bak-local-";
+  const pushCloud = (next) => {
+    if (!supa || !session?.user?.id) return;
+    clearTimeout(syncTimer.current);
+    setSyncStatus("syncing");
+    const uid = session.user.id;
+    syncTimer.current = setTimeout(async () => {
+      try { lastPushRef.current = Date.now(); const { error } = await supa.from("app_state").upsert({ user_id: uid, data: next, updated_at: new Date().toISOString() }); setSyncStatus(error ? "offline" : "synced"); }
+      catch (e) { setSyncStatus("offline"); }
+    }, 700);
+  };
+  const pruneBackups = async () => { try { const r = await store.list(bakPrefix, true); const keys = (r?.keys || []).sort().reverse(); for (const k of keys.slice(8)) await store.delete(k, true); } catch (e) {} };
   const persist = async (next) => {
     setData(next);
     try {
       await store.set(dataKey, JSON.stringify(next), true);
       // rolling automatic backup: one snapshot per day, keep the last 8 backups
-      await store.set(BAK_PREFIX + "auto-" + new Date().toISOString().slice(0, 10), JSON.stringify(next), true);
+      await store.set(bakPrefix + "auto-" + new Date().toISOString().slice(0, 10), JSON.stringify(next), true);
+      pushCloud(next);
       pruneBackups();
     } catch (e) {}
   };
   const writeBackup = async (tag, downloadToo) => {
-    const key = BAK_PREFIX + tag + "-" + new Date().toISOString().slice(0, 16).replace(/[:T]/g, "");
+    const key = bakPrefix + tag + "-" + new Date().toISOString().slice(0, 16).replace(/[:T]/g, "");
     try { await store.set(key, JSON.stringify(data), true); await pruneBackups(); } catch (e) {}
     if (downloadToo) downloadBlob(JSON.stringify(data, null, 2), "application/json", key + ".json");
     refreshBackups();
   };
-  const refreshBackups = async () => { try { const r = await store.list(BAK_PREFIX, true); setBackups((r?.keys || []).sort().reverse().slice(0, 8)); } catch (e) {} };
+  const refreshBackups = async () => { try { const r = await store.list(bakPrefix, true); setBackups((r?.keys || []).sort().reverse().slice(0, 8)); } catch (e) {} };
   const restoreBackup = async (key) => {
     try { const r = await store.get(key, true); if (r?.value && confirm("Restore this backup? Current data will be replaced.")) persist(migrate(JSON.parse(r.value))); } catch (e) {}
   };
@@ -1210,12 +1242,7 @@ export default function LumeTracker() {
     </div>
   );
 
-  const secToggles = [
-    { key: "faceId", label: "Face ID unlock", sub: "Required every time the app opens", icon: ScanFace },
-    { key: "appLock", label: "Auto-lock", sub: "Lock after 60 seconds in background", icon: Lock },
-    { key: "privLaunch", label: "Open in privacy mode", sub: "Amounts hidden until you tap the eye", icon: EyeOff },
-    { key: "hideSwitcher", label: "Hide in app switcher", sub: "Blur the preview when multitasking", icon: AppWindow },
-  ];
+  const lockDurations = [[60, "60 sec"], [300, "5 min"], [600, "10 min"]];
   const exportAllData = () => {
     const rows = [["record", "member", "type", "group_or_category", "name", "details", "currency", "amount_or_balance"].join(",")];
     data.accounts.forEach(a => rows.push(["account", a.owner, a.type, a.group, `"${a.name}"`, `"${(a.sub || "").replace(/"/g, "'")}"`, a.currency, a.balance].join(",")));
@@ -1230,20 +1257,62 @@ export default function LumeTracker() {
   };
   const deleteAccountFully = async () => {
     if (!confirm("Delete your Lume account and ALL data? A final backup will download first.")) return;
-    if (!confirm("Really delete everything? There is no recovery inside the app.")) return;
+    if (!confirm("Really delete everything? Your cloud data, profile and sign-in are removed permanently.")) return;
     await writeBackup("predelete", true);
-    persist(emptyData(me)); setScreen("signin");
+    // 1) remove cloud data + auth user (RPC cascades households, then deletes auth.users)
+    try {
+      if (supa && session?.user?.id) {
+        await supa.from("app_state").delete().eq("user_id", session.user.id);
+        await supa.rpc("delete_my_account");
+      }
+    } catch (e) {}
+    // 2) remove every local copy for this user (data + backups)
+    try {
+      const r = await store.list("lume-", true);
+      for (const k of (r?.keys || [])) if (k === dataKey || k.startsWith(bakPrefix)) await store.delete(k, true);
+    } catch (e) {}
+    // 3) end the session
+    try { if (supa) await supa.auth.signOut(); } catch (e) {}
+    setData(null); setSession(null); initLockRef.current = false; setScreen("signin");
   };
-  const loadDemo = async () => {
-    if (!confirm("Load the generic demo household (Alex & Sam)? Your current data is backed up first.")) return;
-    await writeBackup("predemo", true);
-    persist(DEMO);
+  const editMyName = () => {
+    const v = prompt("Your name", me?.fullName || me?.name || "");
+    if (!v || !v.trim()) return;
+    const fullName = v.trim();
+    const first = fullName.split(/\s+/)[0];
+    persist({ ...data, members: data.members.map(m => m.id === me.id ? { ...m, name: first, fullName, initials: (first[0] || "?").toUpperCase() } : m) });
+  };
+  const SEC = (data && data.security) || { faceId: false, autoLock: true, autoLockSecs: 300, credId: null };
+  const setSecurity = (patch) => persist({ ...data, security: { ...SEC, ...patch } });
+  const enableBiometric = async () => {
+    if (!window.PublicKeyCredential || !navigator.credentials) { alert("This browser doesn't support biometric unlock. It works in the installed app on iOS/Android and in Chrome/Safari/Edge."); return; }
+    try {
+      const cred = await navigator.credentials.create({ publicKey: {
+        challenge: crypto.getRandomValues(new Uint8Array(32)),
+        rp: { name: "Lume", id: location.hostname },
+        user: { id: crypto.getRandomValues(new Uint8Array(16)), name: sessionEmail || "lume-user", displayName: me?.fullName || me?.name || "Lume user" },
+        pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+        authenticatorSelection: { authenticatorAttachment: "platform", userVerification: "required" },
+        timeout: 60000,
+      } });
+      const credId = btoa(String.fromCharCode(...new Uint8Array(cred.rawId)));
+      setSecurity({ faceId: true, credId });
+    } catch (e) { if (e && e.name !== "NotAllowedError") alert("Couldn't set up biometric unlock: " + (e.message || e)); }
+  };
+  const unlockBiometric = async () => {
+    try {
+      const raw = Uint8Array.from(atob(SEC.credId), (c) => c.charCodeAt(0));
+      await navigator.credentials.get({ publicKey: {
+        challenge: crypto.getRandomValues(new Uint8Array(32)),
+        allowCredentials: [{ type: "public-key", id: raw, transports: ["internal"] }],
+        userVerification: "required", timeout: 60000,
+      } });
+      setLocked(false); hiddenAtRef.current = null;
+    } catch (e) { /* stay locked; user can retry or sign out */ }
   };
   const dataRows = [
     { label: "Export my data", sub: "Downloads CSV + full JSON backup", icon: Download, color: INK, onClick: exportAllData },
-    { label: "Two-factor authentication", sub: "On · authenticator app", icon: ShieldCheck, color: INK },
-    { label: "Active sessions", sub: "Samsung Galaxy S22 · this device", icon: Smartphone, color: INK },
-    { label: "Load demo data", sub: "Generic sample household · marked DEMO", icon: RefreshCw, color: INK, onClick: loadDemo },
+    { label: "Active sessions", sub: "This device", icon: Smartphone, color: INK },
     { label: "Clear all data", sub: "Erase everything, keep your profile", icon: EyeOff, color: NEG, onClick: clearAllData },
     { label: "Delete account & data", sub: "Permanent · double-confirmed", icon: Trash2, color: NEG, onClick: deleteAccountFully },
   ];
@@ -1263,13 +1332,28 @@ export default function LumeTracker() {
       </div>
       <div style={{ ...glass(24), padding: "8px 6px", marginBottom: 14 }}>
         <div style={{ ...eyebrow, padding: "11px 13px 5px" }}>App security</div>
-        {secToggles.map((t) => (
-          <div key={t.key} style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 13px", borderRadius: 16 }}>
-            <Ico as={t.icon} size={17} color="rgba(20,38,61,.55)" />
-            <div style={{ flex: 1 }}><div style={{ fontSize: 14, fontWeight: 600 }}>{t.label}</div><div style={{ fontSize: 11, color: "rgba(20,38,61,.5)", marginTop: 1 }}>{t.sub}</div></div>
-            <Toggle on={sec[t.key]} onClick={() => setSec({ ...sec, [t.key]: !sec[t.key] })} />
+        <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 13px", borderRadius: 16 }}>
+          <Ico as={ScanFace} size={17} color="rgba(20,38,61,.55)" />
+          <div style={{ flex: 1 }}><div style={{ fontSize: 14, fontWeight: 600 }}>Biometric unlock</div><div style={{ fontSize: 11, color: "rgba(20,38,61,.5)", marginTop: 1 }}>{SEC.faceId && SEC.credId ? "On — Face ID / fingerprint required" : "Use your device's Face ID or fingerprint"}</div></div>
+          <Toggle on={!!(SEC.faceId && SEC.credId)} onClick={() => { if (SEC.faceId && SEC.credId) { if (confirm("Turn off biometric unlock?")) setSecurity({ faceId: false }); } else enableBiometric(); }} />
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 13px", borderRadius: 16, opacity: SEC.faceId && SEC.credId ? 1 : 0.45 }}>
+          <Ico as={Lock} size={17} color="rgba(20,38,61,.55)" />
+          <div style={{ flex: 1 }}><div style={{ fontSize: 14, fontWeight: 600 }}>Auto-lock</div><div style={{ fontSize: 11, color: "rgba(20,38,61,.5)", marginTop: 1 }}>{SEC.autoLock ? "Locks after time away" : "Only locks when the app restarts"}</div></div>
+          <Toggle on={!!SEC.autoLock} onClick={() => setSecurity({ autoLock: !SEC.autoLock })} />
+        </div>
+        {SEC.faceId && SEC.credId && SEC.autoLock && (
+          <div style={{ display: "flex", gap: 8, padding: "0 13px 11px 42px" }}>
+            {lockDurations.map(([s, lb]) => { const on = (SEC.autoLockSecs || 300) === s; return (
+              <button key={s} onClick={() => setSecurity({ autoLockSecs: s })} style={{ flex: 1, border: `1px solid ${on ? INK : "rgba(20,38,61,.15)"}`, borderRadius: 999, background: on ? INK : "rgba(255,255,255,.55)", color: on ? "#fff" : "rgba(20,38,61,.6)", fontFamily: F_UI, fontSize: 11.5, fontWeight: 600, cursor: "pointer", padding: "6px 4px" }}>{lb}</button>
+            ); })}
           </div>
-        ))}
+        )}
+        <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 13px", borderRadius: 16 }}>
+          <Ico as={EyeOff} size={17} color="rgba(20,38,61,.55)" />
+          <div style={{ flex: 1 }}><div style={{ fontSize: 14, fontWeight: 600 }}>Open in privacy mode</div><div style={{ fontSize: 11, color: "rgba(20,38,61,.5)", marginTop: 1 }}>Amounts hidden until you tap the eye</div></div>
+          <Toggle on={privLaunch} onClick={() => { setPrivLaunch(!privLaunch); if (!privLaunch) setPrivacy(true); }} />
+        </div>
       </div>
       <div style={{ ...glass(24), padding: "8px 6px", marginBottom: 14 }}>
         <div style={{ ...eyebrow, padding: "11px 13px 5px" }}>Your data</div>
@@ -1284,8 +1368,8 @@ export default function LumeTracker() {
       <div style={{ ...glass(20, 18, 0.4), padding: "12px 14px", marginBottom: 14, display: "flex", alignItems: "center", gap: 11 }}>
         <Ico as={ScanFace} size={17} color="rgba(20,38,61,.55)" />
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: 12.5, fontWeight: 600 }}>{sessionEmail ? "Signed in" : supa ? "Not signed in" : "Local mode"}</div>
-          <div style={{ fontSize: 11, color: "rgba(20,38,61,.5)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{sessionEmail || (supa ? "Sign in to sync across devices" : "Data stays on this device")}</div>
+          <div style={{ fontSize: 12.5, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>{me?.fullName || me?.name || "You"}<button onClick={editMyName} title="Edit your name" style={{ border: "none", background: "none", color: ACCENT, fontFamily: F_UI, fontSize: 11, fontWeight: 600, cursor: "pointer", padding: 0 }}>Edit</button></div>
+          <div style={{ fontSize: 11, color: "rgba(20,38,61,.5)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{sessionEmail ? sessionEmail + " · " + ({ synced: "Synced", syncing: "Syncing…", offline: "Offline — will retry", local: "Not synced yet" }[syncStatus] || "") : (supa ? "Sign in to sync across devices" : "Local mode — data stays on this device")}</div>
         </div>
         {sessionEmail && <button onClick={signOut} style={{ border: "1px solid rgba(20,38,61,.15)", borderRadius: 18, background: "rgba(255,255,255,.6)", color: INK, fontFamily: F_UI, fontSize: 12, fontWeight: 600, cursor: "pointer", padding: "8px 14px", flexShrink: 0 }}>Sign out</button>}
       </div>
@@ -1309,7 +1393,7 @@ export default function LumeTracker() {
         {backups.map((k) => (
           <div key={k} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 13px" }}>
             <Ico as={RefreshCw} size={13} color="rgba(20,38,61,.4)" />
-            <span style={{ flex: 1, ...mono(11.5, 500), color: "rgba(20,38,61,.7)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{k.replace(BAK_PREFIX, "")}</span>
+            <span style={{ flex: 1, ...mono(11.5, 500), color: "rgba(20,38,61,.7)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{k.replace(bakPrefix, "")}</span>
             <button onClick={() => restoreBackup(k)} style={{ border: "none", background: "none", color: ACCENT, fontFamily: F_UI, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Restore</button>
           </div>
         ))}
@@ -1903,6 +1987,14 @@ ${rowsHtml}
              don't remount the subtree — preserves scroll position and focus.
              key only changes on navigation, replaying the entrance animation. */}
           <div key={screen} style={{ height: "100%" }}>{screens[screen]()}</div>
+          {locked && (
+            <div style={{ position: "absolute", inset: 0, zIndex: 60, background: "rgba(233,238,246,.72)", backdropFilter: "blur(30px) saturate(1.4)", WebkitBackdropFilter: "blur(30px) saturate(1.4)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 18, animation: "fadein .3s", padding: 24 }}>
+              <div style={{ width: 66, height: 66, borderRadius: 22, background: "linear-gradient(135deg,#5DC4CB,#8A7FD4)", display: "flex", alignItems: "center", justifyContent: "center", boxShadow: "0 18px 36px -14px rgba(23,42,72,.4)" }}><span style={{ fontWeight: 700, fontSize: 26, color: "#fff" }}>L</span></div>
+              <div style={{ textAlign: "center" }}><div style={{ fontSize: 19, fontWeight: 700 }}>Lume is locked</div><div style={{ fontSize: 12.5, color: "rgba(20,38,61,.55)", marginTop: 4 }}>Unlock with Face ID or fingerprint</div></div>
+              <button onClick={unlockBiometric} style={{ display: "flex", alignItems: "center", gap: 9, height: 50, padding: "0 26px", border: "none", borderRadius: 25, background: INK, color: "#fff", fontFamily: F_UI, fontSize: 14.5, fontWeight: 600, cursor: "pointer", boxShadow: "0 14px 26px -12px rgba(20,38,61,.5)" }}><Ico as={ScanFace} size={17} color="#fff" /> Unlock</button>
+              <button onClick={() => { setLocked(false); signOut(); }} style={{ border: "none", background: "none", color: "rgba(20,38,61,.5)", fontFamily: F_UI, fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>Sign out instead</button>
+            </div>
+          )}
           {screen !== "signin" && Dock()}
           {sheet === "share" && ShareSheet()}
           {sheet === "add" && <ExpenseSheet expense={editExpense} owners={ownerNames} meName={me?.name} data={data} onClose={() => { setSheet(null); setEditExpense(null); }} onSave={saveExpenseRecord} onDelete={deleteExpense} onAddCategory={addCategory} />}
