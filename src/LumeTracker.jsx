@@ -5,7 +5,7 @@ import {
   Plane, ShoppingBasket, Banknote, ScanFace, RefreshCw,
   AppWindow, ShieldCheck, Download, Smartphone, Trash2, ImageDown, Link as LinkI,
   X, ChevronLeft, ChevronRight, GraduationCap, Building2, Bitcoin,
-, AlertTriangle } from "lucide-react";
+  AlertTriangle } from "lucide-react";
 
 /* ============================ THEME ============================ */
 const INK = "#14263D", ACCENT = "#0E7086", POS = "#158A62", NEG = "#B4453A";
