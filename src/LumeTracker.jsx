@@ -545,6 +545,9 @@ export default function LumeTracker() {
   const lastPushRef = useRef(0);
   const hiddenAtRef = useRef(null);
   const initLockRef = useRef(false);
+  const [hid, setHid] = useState(null);           // shared household id in the cloud
+  const [actingId, setActingId] = useState(null); // local-only "viewing as" (never synced)
+  const autoBioRef = useRef(false);
   const screenRef = useRef("signin");
   const [avatarMenu, setAvatarMenu] = useState(false);
   const [signinMethod, setSigninMethod] = useState("email"); // email | phone
@@ -559,6 +562,8 @@ export default function LumeTracker() {
   const [planOwner, setPlanOwner] = useState("Combined");
   const [showPropCosts, setShowPropCosts] = useState(false);
   const [openOvClass, setOpenOvClass] = useState(null);
+  const [planTab, setPlanTab] = useState("plan");
+  const [showProjTable, setShowProjTable] = useState(false);
   const [supa, setSupa] = useState(null);          // Supabase client (null = local-only mode)
   const [session, setSession] = useState(null);    // active auth session
   const [authReady, setAuthReady] = useState(false);
@@ -576,53 +581,109 @@ export default function LumeTracker() {
     document.head.appendChild(l);
     return () => { try { document.head.removeChild(l); } catch (e) {} };
   }, []);
-  // Load this user's data once auth has settled. Each signed-in account gets its
-  // own namespaced store, and a brand-new account starts on a clean slate.
+  // Load data once auth settles. Signed-in users belong to a shared household
+  // (one row in household_state); everyone in it sees and edits the same data.
   useEffect(() => {
     if (!authReady) return;
     let cancelled = false;
     (async () => {
       const uid = session?.user?.id;
       const key = uid ? "lume-u-" + uid : "lume-data-v1";
-      // 1) cloud copy wins — it's the shared source of truth across devices
       if (uid && supa) {
+        // 0) accept a pending invite first — it decides which household we join
         try {
-          const { data: row } = await supa.from("app_state").select("data").eq("user_id", uid).maybeSingle();
-          if (!cancelled && row && row.data) {
-            const d = migrate(row.data); setData(d); setSyncStatus("synced");
-            try { await store.set(key, JSON.stringify(d), true); } catch (e) {}
+          const tok = localStorage.getItem("lume-pending-invite");
+          if (tok) {
+            const { data: acc, error } = await supa.rpc("accept_invite", { p_token: tok });
+            localStorage.removeItem("lume-pending-invite");
+            if (error) alert("That invite couldn't be used: " + error.message);
+            else if (acc && acc[0]) {
+              const hh = acc[0].household_id, memId = acc[0].member_id;
+              const { data: row } = await supa.from("household_state").select("data").eq("household_id", hh).maybeSingle();
+              if (row && row.data) {
+                const d = migrate(row.data);
+                const mine = d.members.find((m) => m.id === memId);
+                if (mine) { mine.userId = uid; mine.joined = "Just now"; }
+                if (!cancelled) { setHid(hh); setData(d); setSyncStatus("synced"); }
+                try { lastPushRef.current = Date.now(); await supa.from("household_state").update({ data: d, updated_at: new Date().toISOString() }).eq("household_id", hh); } catch (e) {}
+                try { await store.set(key, JSON.stringify(d), true); } catch (e) {}
+                return;
+              }
+            }
+          }
+        } catch (e) {}
+        // 1) existing membership → load the shared household
+        try {
+          const { data: mem } = await supa.from("household_users").select("household_id").eq("user_id", uid).limit(1);
+          if (mem && mem[0]) {
+            const hh = mem[0].household_id;
+            const { data: row } = await supa.from("household_state").select("data").eq("household_id", hh).maybeSingle();
+            if (!cancelled && row && row.data) {
+              const d = migrate(row.data);
+              setHid(hh); setData(d); setSyncStatus("synced");
+              try { await store.set(key, JSON.stringify(d), true); } catch (e) {}
+              return;
+            }
+          }
+        } catch (e) {}
+        if (cancelled) return;
+        // 2) legacy per-user snapshot → promote it into a shared household
+        try {
+          const { data: legacy } = await supa.from("app_state").select("data").eq("user_id", uid).maybeSingle();
+          if (legacy && legacy.data) {
+            const d = migrate(legacy.data);
+            const meM = d.members.find((m) => m.id === d.currentUserId) || d.members[0];
+            if (meM) meM.userId = uid;
+            const hh = crypto.randomUUID();
+            const { error: e1 } = await supa.from("household_state").insert({ household_id: hh, data: d });
+            if (!e1) {
+              await supa.from("household_users").insert({ household_id: hh, user_id: uid, role: "owner" });
+              if (!cancelled) { setHid(hh); setData(d); setSyncStatus("synced"); }
+              try { await store.set(key, JSON.stringify(d), true); } catch (e) {}
+              return;
+            }
+          }
+        } catch (e) {}
+        if (cancelled) return;
+        // 3) brand-new account → fresh household
+        try {
+          const first = memberFromSession(session); first.userId = uid;
+          const fresh = migrate(emptyData(first));
+          const hh = crypto.randomUUID();
+          const { error: e1 } = await supa.from("household_state").insert({ household_id: hh, data: fresh });
+          if (!e1) {
+            await supa.from("household_users").insert({ household_id: hh, user_id: uid, role: "owner" });
+            if (!cancelled) { setHid(hh); setData(fresh); setSyncStatus("synced"); }
+            try { await store.set(key, JSON.stringify(fresh), true); } catch (e) {}
             return;
           }
         } catch (e) {}
+        // 4) cloud unreachable → local cache so the app still opens
+        try { const r = await store.get(key, true); if (!cancelled && r && r.value) { setData(migrate(JSON.parse(r.value))); setSyncStatus("offline"); return; } } catch (e) {}
+        if (!cancelled) { const first = memberFromSession(session); first.userId = uid; setData(migrate(emptyData(first))); setSyncStatus("offline"); }
+        return;
       }
+      // signed-out local mode
+      try { const r = await store.get(key, true); if (!cancelled && r && r.value) { setData(migrate(JSON.parse(r.value))); return; } } catch (e) {}
       if (cancelled) return;
-      // 2) local copy — push it up so other devices see it
-      try {
-        const r = await store.get(key, true);
-        if (!cancelled && r && r.value) { const d = migrate(JSON.parse(r.value)); setData(d); if (uid) pushCloud(d); return; }
-      } catch (e) {}
-      if (cancelled) return;
-      // 3) brand-new account: clean slate from the auth identity
-      const first = session ? memberFromSession(session) : { id: "m_me", name: "You", fullName: "You", initials: "Y", gradient: GRADIENTS._palette[0], color: MEMBER_COLOR._palette[0], role: "owner", joined: "Just now" };
+      const first = { id: "m_me", name: "You", fullName: "You", initials: "Y", gradient: GRADIENTS._palette[0], color: MEMBER_COLOR._palette[0], role: "owner", joined: "Just now" };
       const fresh = migrate(emptyData(first));
       setData(fresh);
       try { await store.set(key, JSON.stringify(fresh), true); } catch (e) {}
-      if (uid) pushCloud(fresh);
     })();
     return () => { cancelled = true; };
   }, [authReady, session?.user?.id, supa]);
-  // Live sync: apply changes made on another device
+  // Live sync: apply edits from any household member's device
   useEffect(() => {
-    if (!supa || !session?.user?.id) return;
-    const uid = session.user.id;
-    const ch = supa.channel("lume-state-" + uid)
-      .on("postgres_changes", { event: "*", schema: "public", table: "app_state", filter: "user_id=eq." + uid }, (payload) => {
+    if (!supa || !hid) return;
+    const ch = supa.channel("lume-hh-" + hid)
+      .on("postgres_changes", { event: "*", schema: "public", table: "household_state", filter: "household_id=eq." + hid }, (payload) => {
         if (Date.now() - lastPushRef.current < 2500) return; // ignore our own write echo
         if (payload.new && payload.new.data) setData(migrate(payload.new.data));
       })
       .subscribe();
     return () => { try { supa.removeChannel(ch); } catch (e) {} };
-  }, [supa, session?.user?.id]);
+  }, [supa, hid]);
   // Biometric lock: lock once on first load if enabled, and on return after the auto-lock window
   useEffect(() => {
     if (!data || initLockRef.current) return;
@@ -700,10 +761,17 @@ export default function LumeTracker() {
     setAuthBusy(false);
     setAuthMsg(error ? error.message : "Check your inbox — we sent you a sign-in link.");
   };
-  const signOut = async () => { if (supa) { await supa.auth.signOut(); } setScreen("signin"); };
+  const signOut = async () => { if (supa) { try { await supa.auth.signOut(); } catch (e) {} } setHid(null); setActingId(null); initLockRef.current = false; autoBioRef.current = false; setScreen("signin"); };
   // Hardware/browser back: never return to the sign-in page. Inside the app,
   // back goes Home first; back again asks whether to sign out.
   useEffect(() => { screenRef.current = screen; }, [screen]);
+  useEffect(() => {
+    try {
+      const u = new URL(window.location.href);
+      const t = u.searchParams.get("invite");
+      if (t) { localStorage.setItem("lume-pending-invite", t); u.searchParams.delete("invite"); history.replaceState({}, "", u.pathname + (u.search || "")); }
+    } catch (e) {}
+  }, []);
   useEffect(() => {
     history.pushState({ lume: 1 }, "");
     const onPop = () => {
@@ -720,12 +788,12 @@ export default function LumeTracker() {
   const dataKey = session?.user?.id ? "lume-u-" + session.user.id : "lume-data-v1";
   const bakPrefix = session?.user?.id ? "lume-bak-" + session.user.id.slice(0, 8) + "-" : "lume-bak-local-";
   const pushCloud = (next) => {
-    if (!supa || !session?.user?.id) return;
+    if (!supa || !hid) return;
     clearTimeout(syncTimer.current);
     setSyncStatus("syncing");
-    const uid = session.user.id;
+    const hh = hid;
     syncTimer.current = setTimeout(async () => {
-      try { lastPushRef.current = Date.now(); const { error } = await supa.from("app_state").upsert({ user_id: uid, data: next, updated_at: new Date().toISOString() }); setSyncStatus(error ? "offline" : "synced"); }
+      try { lastPushRef.current = Date.now(); const { error } = await supa.from("household_state").update({ data: next, updated_at: new Date().toISOString() }).eq("household_id", hh); setSyncStatus(error ? "offline" : "synced"); }
       catch (e) { setSyncStatus("offline"); }
     }, 700);
   };
@@ -785,7 +853,14 @@ export default function LumeTracker() {
 
   /* ---- members & permissions ---- */
   const members = data.members || [];
-  const me = members.find(m => m.id === data.currentUserId) || members[0];
+  const uidNow = session?.user?.id || null;
+  const linkedMe = uidNow ? members.find((m) => m.userId === uidNow) : null;
+  const actingTarget = actingId ? members.find((m) => m.id === actingId) : null;
+  // You may act as yourself or any offline member — never as another signed-in person
+  const me = (actingTarget && (!actingTarget.userId || actingTarget.userId === uidNow) ? actingTarget : null)
+    || linkedMe
+    || members.find((m) => m.id === data.currentUserId)
+    || members[0];
   const memberByName = (n) => members.find(m => m.name === n);
   const ownerNames = [...members.map(m => m.name), JOINT];
   const hiddenForMe = (data.hidden && data.hidden[me?.id]) || [];
@@ -890,10 +965,30 @@ export default function LumeTracker() {
   };
   const deleteAccount = (id) => { persist({ ...data, accounts: data.accounts.filter(a => a.id !== id && a.linkedTo !== id) }); setEditAccount(null); setSheet(null); };
 
-  const saveMember = (rec) => {
+  const shareInvite = async (link, email) => {
+    const text = "Join our household on Lume — track and plan our finances together: " + link;
+    if (navigator.share) { try { await navigator.share({ title: "Lume invite", text, url: link }); return; } catch (e) { if (e && e.name === "AbortError") return; } }
+    try { await navigator.clipboard.writeText(link); } catch (e) {}
+    window.open("mailto:" + encodeURIComponent(email) + "?subject=" + encodeURIComponent("Join our Lume household") + "&body=" + encodeURIComponent(text));
+    alert("Invite link copied — an email draft has also opened. The link works for 14 days.");
+  };
+  const saveMember = async (rec) => {
     const exists = members.some(m => m.id === rec.id);
     if (!exists && members.length >= 2 && !isPremium) { setEditMember(null); setSheet(null); openPaywall("Unlimited household members"); return; }
-    const list = exists ? members.map(m => m.id === rec.id ? { ...m, ...rec } : m) : [...members, rec];
+    let rec2 = rec;
+    if (!exists && rec.inviteEmail) {
+      if (!supa || !hid || !session) { alert("Sign in first to send invites — the link connects their account to this household."); rec2 = { ...rec, inviteEmail: "" }; }
+      else {
+        try {
+          const token = crypto.randomUUID();
+          const { error } = await supa.from("household_invites").insert({ token, household_id: hid, member_id: rec.id, email: rec.inviteEmail, created_by: session.user.id });
+          if (error) throw error;
+          rec2 = { ...rec, inviteToken: token };
+          shareInvite(window.location.origin + "/?invite=" + token, rec.inviteEmail);
+        } catch (e) { alert("Couldn't create the invite: " + (e.message || e)); rec2 = { ...rec, inviteEmail: "" }; }
+      }
+    }
+    const list = exists ? members.map(m => m.id === rec2.id ? { ...m, ...rec2 } : m) : [...members, rec2];
     persist({ ...data, members: list }); setEditMember(null); setSheet(null);
   };
   const removeMemberFromView = (id) => {
@@ -913,11 +1008,13 @@ export default function LumeTracker() {
     arr.has(granteeId) ? arr.delete(granteeId) : arr.add(granteeId); g[ownerId] = [...arr];
     persist({ ...data, grants: g });
   };
-  const setActingUser = (id) => persist({ ...data, currentUserId: id });
+  const setActingUser = (id) => setActingId(id); // local to this device — each person keeps their own view
   const setPlanning = (patch) => persist({ ...data, planning: { ...data.planning, ...patch } });
   const PS = data.propertySim || DEFAULT_PROP;
   const setPropertySim = (patch) => persist({ ...data, propertySim: { ...PS, ...patch } });
   const CP = data.cpfPlan || { monthlyContrib: 3700 };
+  const cpfAutoContrib = CP.salary ? Math.round(0.37 * Math.min(CP.salary, 6800) * 0.75) : null;
+  const cpfContrib = CP.useSalary && cpfAutoContrib != null ? cpfAutoContrib : CP.monthlyContrib;
   const setCpfPlan = (patch) => persist({ ...data, cpfPlan: { ...CP, ...patch } });
   const setScenarioB = (v) => persist({ ...data, scenarioB: v });
   const L = data.legacy || SEED.legacy;
@@ -985,7 +1082,10 @@ export default function LumeTracker() {
         <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "2px 0" }}>
           <span style={{ flex: 1, height: 1, background: "rgba(20,38,61,.12)" }} /><span style={{ fontSize: 11, color: "rgba(20,38,61,.4)" }}>or</span><span style={{ flex: 1, height: 1, background: "rgba(20,38,61,.12)" }} />
         </div>
-        <div style={{ width: 172, alignSelf: "center" }}><Seg items={["Email", "Mobile"]} value={signinMethod === "email" ? "Email" : "Mobile"} onChange={(v) => { setSigninMethod(v === "Email" ? "email" : "phone"); setOtpStage(false); setAuthMsg(""); }} small /></div>
+        <div style={{ display: "flex", gap: 4, background: "rgba(20,38,61,.06)", borderRadius: 999, padding: 3, width: 200, alignSelf: "center" }}>
+          <button style={{ flex: 1, border: "none", cursor: "default", padding: "6px 10px", borderRadius: 999, fontSize: 11.5, fontWeight: 600, fontFamily: F_UI, background: "#fff", color: INK, boxShadow: "0 2px 6px rgba(23,42,72,.18)" }}>Email</button>
+          <button disabled title="Mobile sign-in is coming soon" style={{ flex: 1, border: "none", cursor: "not-allowed", padding: "6px 10px", borderRadius: 999, fontSize: 11.5, fontWeight: 600, fontFamily: F_UI, background: "transparent", color: "rgba(20,38,61,.3)" }}>Mobile · soon</button>
+        </div>
         {signinMethod === "email" ? (
           <div style={{ display: "flex", gap: 8 }}>
             <input value={signinEmail} onChange={(e) => setSigninEmail(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") emailLink(); }} type="email" inputMode="email" autoComplete="email" placeholder="you@email.com" style={{ flex: 1, minWidth: 0, height: 52, borderRadius: 26, border: "1px solid rgba(255,255,255,.75)", background: "rgba(255,255,255,.6)", padding: "0 18px", fontFamily: F_UI, fontSize: 15, color: INK, outline: "none" }} />
@@ -1308,8 +1408,8 @@ export default function LumeTracker() {
         <Ico as={Users} size={16} color="rgba(20,38,61,.55)" />
         <div style={{ flex: 1, fontSize: 11.5, color: "rgba(20,38,61,.6)" }}>Viewing as <b>{me?.name}</b> — tap to switch</div>
         <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
-          {members.map((m) => { const on = m.id === me?.id; return (
-            <button key={m.id} onClick={() => setActingUser(m.id)} title={m.name} style={{ width: 34, height: 34, borderRadius: 17, border: on ? `2px solid ${ACCENT}` : "2px solid transparent", padding: 0, background: m.gradient, color: "#fff", fontWeight: 700, fontSize: 12, cursor: "pointer", opacity: on ? 1 : 0.55, boxShadow: on ? "0 4px 10px -3px rgba(14,112,134,.5)" : "none", transition: "opacity .15s", flexShrink: 0 }}>{m.initials}</button>
+          {members.map((m) => { const on = m.id === me?.id; const otherUser = m.userId && m.userId !== uidNow; return (
+            <button key={m.id} disabled={otherUser} onClick={() => !otherUser && setActingUser(m.id)} title={otherUser ? m.name + " · signed-in member" : m.name} style={{ width: 34, height: 34, borderRadius: 17, border: on ? `2px solid ${ACCENT}` : "2px solid transparent", padding: 0, background: m.gradient, color: "#fff", fontWeight: 700, fontSize: 12, cursor: otherUser ? "not-allowed" : "pointer", opacity: on ? 1 : otherUser ? 0.3 : 0.55, boxShadow: on ? "0 4px 10px -3px rgba(14,112,134,.5)" : "none", transition: "opacity .15s", flexShrink: 0 }}>{m.initials}</button>
           ); })}
         </div>
       </div>
@@ -1336,6 +1436,11 @@ export default function LumeTracker() {
     // 1) remove cloud data + auth user (RPC cascades households, then deletes auth.users)
     try {
       if (supa && session?.user?.id) {
+        if (hid) {
+          const { data: mems } = await supa.from("household_users").select("user_id").eq("household_id", hid);
+          if (!mems || mems.length <= 1) await supa.from("household_state").delete().eq("household_id", hid); // last member takes the household down
+          else await supa.from("household_users").delete().eq("household_id", hid).eq("user_id", session.user.id); // otherwise just leave it
+        }
         await supa.from("app_state").delete().eq("user_id", session.user.id);
         await supa.rpc("delete_my_account");
       }
@@ -1373,6 +1478,12 @@ export default function LumeTracker() {
       setSecurity({ faceId: true, credId });
     } catch (e) { if (e && e.name !== "NotAllowedError") alert("Couldn't set up biometric unlock: " + (e.message || e)); }
   };
+  useEffect(() => {
+    if (!locked || autoBioRef.current) return;
+    autoBioRef.current = true;
+    const t = setTimeout(() => { unlockBiometric(); }, 450);
+    return () => clearTimeout(t);
+  }, [locked]);
   const unlockBiometric = async () => {
     try {
       const raw = Uint8Array.from(atob(SEC.credId), (c) => c.charCodeAt(0));
@@ -1412,7 +1523,7 @@ export default function LumeTracker() {
         <div style={{ ...eyebrow, padding: "11px 13px 5px" }}>App security</div>
         <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 13px", borderRadius: 16 }}>
           <Ico as={ScanFace} size={17} color="rgba(20,38,61,.55)" />
-          <div style={{ flex: 1 }}><div style={{ fontSize: 14, fontWeight: 600 }}>Biometric unlock</div><div style={{ fontSize: 11, color: "rgba(20,38,61,.5)", marginTop: 1 }}>{SEC.faceId && SEC.credId ? "On — Face ID / fingerprint required" : "Use your device's Face ID or fingerprint"}</div></div>
+          <div style={{ flex: 1 }}><div style={{ fontSize: 14, fontWeight: 600 }}>Biometric sign-in</div><div style={{ fontSize: 11, color: "rgba(20,38,61,.5)", marginTop: 1 }}>{SEC.faceId && SEC.credId ? "On — Face ID / fingerprint to enter" : "Sign back in with Face ID or fingerprint"}</div></div>
           <Toggle on={!!(SEC.faceId && SEC.credId)} onClick={() => { if (SEC.faceId && SEC.credId) { if (confirm("Turn off biometric unlock?")) setSecurity({ faceId: false }); } else enableBiometric(); }} />
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 13px", borderRadius: 16, opacity: SEC.faceId && SEC.credId ? 1 : 0.45 }}>
@@ -1487,7 +1598,9 @@ export default function LumeTracker() {
   /* ---- PLAN SCREEN ---- */
   const P = data.planning || SEED.planning;
   const fireNum = fireNumber(P.annualExpenses, P.swr);
-  const yearsToRetire = Math.max(0, P.retireAge - P.currentAge);
+  const derivedAge = me?.birthYear ? Math.min(90, Math.max(16, new Date().getFullYear() - me.birthYear)) : null;
+  const curAge = derivedAge ?? P.currentAge;
+  const yearsToRetire = Math.max(0, P.retireAge - curAge);
   const planMemberView = planOwner !== "Combined" && visibleMembers.some((mm) => mm.name === planOwner);
   const planAccounts = data.accounts.filter((a) => !planMemberView || a.owner === planOwner || a.owner === "Joint");
   const pw = (a) => toSGD(a) * (planMemberView && a.owner === "Joint" ? 0.5 : 1);
@@ -1517,7 +1630,7 @@ export default function LumeTracker() {
   const projYears = (yearsToRetire || 20);
   const proj = projectWealthByBuckets({ buckets, rates, monthlyInvest: P.monthlyInvest, inflation: P.inflation, years: projYears });
   const yrsToFire = yearsToTarget({ startNW: NWp, monthlyInvest: P.monthlyInvest, returnRate: effReturn, inflation: P.inflation, target: fireNum });
-  const fireAge = yrsToFire == null ? null : P.currentAge + yrsToFire;
+  const fireAge = yrsToFire == null ? null : curAge + yrsToFire;
   const B = data.scenarioB;
   const bRates = B ? (B.classRates || CLASS_PRESETS[B.mode || "base"]) : null;
   const projB = B ? projectWealthByBuckets({ buckets, rates: bRates, monthlyInvest: B.monthlyInvest, inflation: B.inflation, years: projYears }) : null;
@@ -1536,9 +1649,9 @@ export default function LumeTracker() {
   const endExpected = proj.expected[proj.expected.length - 1];
   const propRes = propertySim(PS, effReturn);
   const cpfNow = classBal.CPF;
-  const cpfYrs = Math.max(0, 55 - P.currentAge);
+  const cpfYrs = Math.max(0, 55 - curAge);
   const cpfG = 0.032; // blended OA/SA/MA growth
-  const cpfAt55 = cpfNow * Math.pow(1 + cpfG, cpfYrs) + (CP.monthlyContrib * 12) * (cpfYrs > 0 ? (Math.pow(1 + cpfG, cpfYrs) - 1) / cpfG : 0);
+  const cpfAt55 = cpfNow * Math.pow(1 + cpfG, cpfYrs) + (cpfContrib * 12) * (cpfYrs > 0 ? (Math.pow(1 + cpfG, cpfYrs) - 1) / cpfG : 0);
   const frsHouseholdAt55 = 213000 * Math.pow(1.035, cpfYrs) * (planMemberView ? 1 : 2); // escalating FRS × members in view
   const cpfPct = Math.min(100, cpfAt55 / frsHouseholdAt55 * 100);
   const pillBtn = { border: "1px solid rgba(20,38,61,.15)", borderRadius: 999, background: "rgba(255,255,255,.55)", color: INK, fontFamily: F_UI, fontSize: 11.5, fontWeight: 600, cursor: "pointer", padding: "7px 12px" };
@@ -1556,7 +1669,7 @@ export default function LumeTracker() {
       <span style={{ fontSize: 13, color: "rgba(20,38,61,.7)", display: "flex", alignItems: "center", minWidth: 0 }}><span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{label}</span>{tip && <Tip text={tip} />}</span>
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
         <button onClick={onDec} style={stepBtn}>–</button>
-        <button onClick={() => { if (!onSet) return; const v = prompt(label, String(val)); if (v == null) return; const nn = parseFloat(String(v).replace(/[^0-9.\-]/g, "")); if (!isNaN(nn)) onSet(nn); }} title={onSet ? "Tap to type a value" : undefined} style={{ ...mono(13, 600), minWidth: 74, textAlign: "center", background: "none", border: "none", padding: 0, cursor: onSet ? "pointer" : "default", color: INK, textDecoration: onSet ? "underline dotted rgba(20,38,61,.4)" : "none", textUnderlineOffset: 3 }}>{unit === "$" ? fmt(val) : val + unit}</button>
+        <button onClick={() => { if (!onSet) return; const v = prompt(label, String(val)); if (v == null) return; const nn = parseFloat(String(v).replace(/[^0-9.\-]/g, "")); if (!isNaN(nn)) onSet(nn); }} title={onSet ? "Tap to type a value" : undefined} style={{ ...mono(13, 600), minWidth: 74, textAlign: "left", background: "none", border: "none", padding: 0, cursor: onSet ? "pointer" : "default", color: INK, textDecoration: onSet ? "underline dotted rgba(20,38,61,.4)" : "none", textUnderlineOffset: 3 }}>{unit === "$" ? fmt(val) : val + unit}</button>
         <button onClick={onInc} style={stepBtn}>+</button>
       </div>
     </div>
@@ -1583,14 +1696,20 @@ export default function LumeTracker() {
         </div>
       </div>
 
+      <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+        {[["plan", "Plan"], ["tools", "Tools"]].map(([k, lb]) => { const on = planTab === k; return (
+          <button key={k} onClick={() => setPlanTab(k)} style={{ flex: 1, height: 40, border: `1px solid ${on ? ACCENT : "rgba(20,38,61,.12)"}`, borderRadius: 20, background: on ? "rgba(14,112,134,.1)" : "rgba(255,255,255,.5)", color: on ? ACCENT : "rgba(20,38,61,.55)", fontFamily: F_UI, fontSize: 13, fontWeight: 700, cursor: "pointer" }}>{lb}</button>
+        ); })}
+      </div>
       <div style={{ position: "relative" }}>
+      {planTab === "plan" && (<>
       <div style={{ ...glass(24), padding: "17px 18px", marginBottom: 14 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
           <span style={eyebrow}>Wealth projection</span>
           <span style={{ ...mono(11), color: "rgba(20,38,61,.45)" }}>real terms · {projYears}y</span>
         </div>
         <div style={{ ...mono(22), marginBottom: 2 }}>{mask(fmt(endExpected))}</div>
-        <div style={{ fontSize: 11.5, color: "rgba(20,38,61,.5)", marginBottom: 10 }}>at age {P.currentAge + projYears} · blended {effReturn}% nominal · {mode} case</div>
+        <div style={{ fontSize: 11.5, color: "rgba(20,38,61,.5)", marginBottom: 10 }}>at age {curAge + projYears} · blended {effReturn}% nominal · {mode} case</div>
         <div style={{ position: "relative" }}>
         <svg width="100%" height="150" viewBox="0 0 320 150" preserveAspectRatio="none" style={{ display: "block", touchAction: "pan-y" }}
           onMouseMove={(e) => { const rc = e.currentTarget.getBoundingClientRect(); const fr = Math.min(1, Math.max(0, (e.clientX - rc.left) / rc.width)); setProjHover(Math.round(fr * (proj.expected.length - 1))); }}
@@ -1612,7 +1731,7 @@ export default function LumeTracker() {
         </svg>
         {projHover != null && proj.expected[projHover] != null && (
           <div style={{ position: "absolute", top: 2, left: `${(4 + (projHover / (proj.expected.length - 1)) * 312) / 320 * 100}%`, transform: `translateX(${projHover > proj.expected.length * 0.7 ? "-100%" : projHover < proj.expected.length * 0.3 ? "0" : "-50%"})`, background: "rgba(20,38,61,.94)", color: "#fff", borderRadius: 10, padding: "6px 10px", fontSize: 11, fontFamily: F_MONO, whiteSpace: "nowrap", pointerEvents: "none", zIndex: 2, lineHeight: 1.5 }}>
-            Age {P.currentAge + projHover}{"\u2003"}{privacy ? "••••" : fmt(proj.expected[projHover])}{projB && projB.expected[projHover] != null ? <><br />B{"\u2003"}{privacy ? "••••" : fmt(projB.expected[projHover])}</> : null}
+            Age {curAge + projHover}{"\u2003"}{privacy ? "••••" : fmt(proj.expected[projHover])}{projB && projB.expected[projHover] != null ? <><br />B{"\u2003"}{privacy ? "••••" : fmt(projB.expected[projHover])}</> : null}
           </div>
         )}
         </div>
@@ -1622,6 +1741,34 @@ export default function LumeTracker() {
           <span style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "rgba(20,38,61,.6)" }}><span style={{ width: 14, height: 2, borderTop: "1.5px dashed #D9A554" }} />FIRE target</span>
           {expB && <span style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "rgba(20,38,61,.6)" }}><span style={{ width: 14, height: 2, borderTop: "1.5px dashed #8A7FD4" }} />Scenario B</span>}
         </div>
+        <button onClick={() => setShowProjTable(!showProjTable)} style={{ width: "100%", textAlign: "left", border: "none", background: "none", padding: "10px 0 0", cursor: "pointer", fontFamily: F_UI, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ fontSize: 13, fontWeight: 600, color: ACCENT }}>{showProjTable ? "Hide the maths ▴" : "See the maths, year by year ▾"}</span>
+          <span style={{ ...mono(11.5, 500), color: "rgba(20,38,61,.5)" }}>{projYears} rows</span>
+        </button>
+        {showProjTable && (
+          <div style={{ marginTop: 8, maxHeight: 300, overflowY: "auto", borderRadius: 12, border: "1px solid rgba(20,38,61,.08)" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", ...mono(10.5, 500) }}>
+              <thead><tr>{["Age", "Start", "+ Saved", "+ Growth", "End"].map((h, i) => <th key={h} style={{ position: "sticky", top: 0, background: "rgba(240,244,250,.98)", textAlign: i === 0 ? "left" : "right", padding: "7px 8px", fontWeight: 700, color: "rgba(20,38,61,.55)", borderBottom: "1px solid rgba(20,38,61,.12)" }}>{h}</th>)}</tr></thead>
+              <tbody>
+                {proj.expected.slice(1).map((end, i) => {
+                  const start = proj.expected[i];
+                  const saved = P.monthlyInvest * 12;
+                  const growth = end - start - saved;
+                  return (
+                    <tr key={i} style={{ background: (curAge + i + 1) === fireAge ? "rgba(217,165,84,.12)" : i % 2 ? "rgba(20,38,61,.025)" : "transparent" }}>
+                      <td style={{ padding: "5px 8px", textAlign: "left" }}>{curAge + i + 1}{(curAge + i + 1) === fireAge ? " ★" : ""}</td>
+                      <td style={{ padding: "5px 8px", textAlign: "right" }}>{privacy ? "••••" : fmtShort(start)}</td>
+                      <td style={{ padding: "5px 8px", textAlign: "right", color: ACCENT }}>{privacy ? "••••" : "+" + fmtShort(saved)}</td>
+                      <td style={{ padding: "5px 8px", textAlign: "right", color: growth >= 0 ? POS : NEG }}>{privacy ? "••••" : (growth >= 0 ? "+" : "−") + fmtShort(Math.abs(growth))}</td>
+                      <td style={{ padding: "5px 8px", textAlign: "right", fontWeight: 700 }}>{privacy ? "••••" : fmtShort(end)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+            <div style={{ fontSize: 10.5, color: "rgba(20,38,61,.5)", padding: "7px 10px", lineHeight: 1.5, borderTop: "1px solid rgba(20,38,61,.08)" }}>Real (inflation-adjusted) dollars, matching the chart. "Saved" is your monthly investing × 12; "Growth" is everything else — each asset class compounding at its rate (CPF, property and investments included), minus inflation, plus liability paydown. ★ = the year you reach FIRE.</div>
+          </div>
+        )}
         <div style={{ display: "flex", gap: 8, marginTop: 14, flexWrap: "wrap", alignItems: "center" }}>
           {!B ? (
             <button style={pillBtn} onClick={() => setScenarioB({ ...P, mode, classRates: rates })}>+ Save as Scenario B, then tweak</button>
@@ -1678,11 +1825,11 @@ export default function LumeTracker() {
                     <button onClick={() => setOpenOvClass(open ? null : c)} style={{ ...mono(9, 700), letterSpacing: ".03em", padding: "2px 7px", borderRadius: 999, border: "none", cursor: "pointer", background: rateMode === "class" ? "rgba(20,38,61,.1)" : "rgba(14,112,134,.16)", color: rateMode === "class" ? "rgba(20,38,61,.45)" : ACCENT, textDecoration: rateMode === "class" ? "line-through" : "none" }}>{ovs.length} INDIVIDUAL {open ? "▴" : "▾"}</button>
                   )}
                 </div>
-                <div style={{ ...mono(10.5, 500), color: "rgba(20,38,61,.45)" }}>{privacy ? "••••" : fmtShort(classBal[c])}{classDriven && rateMode !== "class" ? " · fully individual" : ""}</div>
+                <div style={{ ...mono(10.5, 500), color: "rgba(20,38,61,.45)", textAlign: "left" }}>{privacy ? "••••" : fmtShort(classBal[c])}{classDriven && rateMode !== "class" ? " · fully individual" : ""}</div>
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: 10, opacity: (rateMode === "individual" || classDriven) && c !== "Liabilities" ? 0.4 : 1 }}>
                 <button onClick={() => setPlanning({ mode: "custom", classRates: { ...rates, [c]: +((rates[c] || 0) - 0.5).toFixed(1) } })} style={stepBtn}>–</button>
-                <button onClick={() => { const v = prompt(c + " growth % / yr", String(rates[c] || 0)); if (v == null) return; const nn = parseFloat(String(v).replace(/[^0-9.\-]/g, "")); if (!isNaN(nn)) setPlanning({ mode: "custom", classRates: { ...rates, [c]: +nn.toFixed(1) } }); }} style={{ ...mono(12.5, 600), minWidth: 56, textAlign: "center", background: "none", border: "none", padding: 0, cursor: "pointer", color: INK, textDecoration: "underline dotted rgba(20,38,61,.4)", textUnderlineOffset: 3 }}>{(rates[c] || 0).toFixed(1)}%</button>
+                <button onClick={() => { const v = prompt(c + " growth % / yr", String(rates[c] || 0)); if (v == null) return; const nn = parseFloat(String(v).replace(/[^0-9.\-]/g, "")); if (!isNaN(nn)) setPlanning({ mode: "custom", classRates: { ...rates, [c]: +nn.toFixed(1) } }); }} style={{ ...mono(12.5, 600), minWidth: 56, textAlign: "left", background: "none", border: "none", padding: 0, cursor: "pointer", color: INK, textDecoration: "underline dotted rgba(20,38,61,.4)", textUnderlineOffset: 3 }}>{(rates[c] || 0).toFixed(1)}%</button>
                 <button onClick={() => setPlanning({ mode: "custom", classRates: { ...rates, [c]: +((rates[c] || 0) + 0.5).toFixed(1) } })} style={stepBtn}>+</button>
               </div>
             </div>
@@ -1710,7 +1857,15 @@ export default function LumeTracker() {
         <div style={{ ...eyebrow, margin: "14px 0 6px" }}>Projection engine · drives the fan chart</div>
         <AssumptionRow label="Monthly investing" val={P.monthlyInvest} unit="$" onDec={() => setPlanning({ monthlyInvest: Math.max(0, P.monthlyInvest - 1000) })} onInc={() => setPlanning({ monthlyInvest: P.monthlyInvest + 1000 })} onSet={(nn) => setPlanning({ monthlyInvest: Math.max(0, Math.round(nn)) })} />
         <AssumptionRow label="Inflation" val={P.inflation} unit="%" onDec={() => setPlanning({ inflation: Math.max(0, +(P.inflation - 0.5).toFixed(1)) })} onInc={() => setPlanning({ inflation: +(P.inflation + 0.5).toFixed(1) })} onSet={(nn) => setPlanning({ inflation: Math.min(15, Math.max(0, +nn.toFixed(2))) })} />
-        <AssumptionRow label="Target retirement age" val={P.retireAge} unit="" onDec={() => setPlanning({ retireAge: Math.max(P.currentAge + 1, P.retireAge - 1) })} onInc={() => setPlanning({ retireAge: P.retireAge + 1 })} onSet={(nn) => setPlanning({ retireAge: Math.max(P.currentAge + 1, Math.round(nn)) })} />
+        {derivedAge != null ? (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "9px 0", borderBottom: "1px solid rgba(20,38,61,.06)" }}>
+            <span style={{ fontSize: 13, color: "rgba(20,38,61,.7)" }}>Current age</span>
+            <span style={{ ...mono(13, 600), minWidth: 74, textAlign: "left" }}>{derivedAge}<span style={{ fontSize: 10, color: "rgba(20,38,61,.4)", fontFamily: F_UI, fontWeight: 500 }}> · from profile</span></span>
+          </div>
+        ) : (
+          <AssumptionRow label="Current age" val={P.currentAge} unit="" tip="Set your birth year on your member profile (Family tab) to keep this automatic." onDec={() => setPlanning({ currentAge: Math.max(16, P.currentAge - 1) })} onInc={() => setPlanning({ currentAge: Math.min(90, P.currentAge + 1) })} onSet={(nn) => setPlanning({ currentAge: Math.min(90, Math.max(16, Math.round(nn))) })} />
+        )}
+        <AssumptionRow label="Target retirement age" val={P.retireAge} unit="" onDec={() => setPlanning({ retireAge: Math.max(curAge + 1, P.retireAge - 1) })} onInc={() => setPlanning({ retireAge: P.retireAge + 1 })} onSet={(nn) => setPlanning({ retireAge: Math.max(curAge + 1, Math.round(nn)) })} />
         <div style={{ fontSize: 11, color: "rgba(20,38,61,.45)", marginTop: 8, lineHeight: 1.5 }}>Asset balances come from Wealth automatically; growth rates from the card above. FIRE ring = net worth ÷ (spend ÷ SWR). Chart = balances compounding at class rates + monthly investing, to your target age.</div>
       </div>
 
@@ -1724,6 +1879,8 @@ export default function LumeTracker() {
           <div style={{ ...mono(20), marginTop: 5 }}>{mask(fmt(Math.max(0, fireNum - NWp)))}</div>
         </div>
       </div>
+      </>)}
+      {planTab === "tools" && (<>
       <div style={{ ...glass(24), padding: "17px 18px", marginBottom: 14 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
           <span style={eyebrow}>Property as an investment</span>
@@ -1749,7 +1906,7 @@ export default function LumeTracker() {
           </div>
         </div>
         <AssumptionRow label="Loan rate" val={PS.ratePct} unit="%" onDec={() => setPropertySim({ ratePct: Math.max(1, +(PS.ratePct - 0.25).toFixed(2)) })} onInc={() => setPropertySim({ ratePct: +(PS.ratePct + 0.25).toFixed(2) })} onSet={(nn) => setPropertySim({ ratePct: Math.min(10, Math.max(0.5, +nn.toFixed(2))) })} />
-        <AssumptionRow label="Loan tenure" val={PS.tenorYrs} unit=" yrs" tip="Max tenure is typically 30 years, capped so the loan ends by age 65. Longer tenure lowers monthly payments but raises total interest." onDec={() => setPropertySim({ tenorYrs: Math.max(5, PS.tenorYrs - 5) })} onInc={() => setPropertySim({ tenorYrs: Math.min(35, PS.tenorYrs + 5) })} onSet={(nn) => setPropertySim({ tenorYrs: Math.min(35, Math.max(5, Math.round(nn))) })} />
+        <AssumptionRow label="Loan tenure" val={PS.tenorYrs} unit=" yrs" tip={"Banks cap private-property loans at 30 years, and the loan must usually end by age 65." + (derivedAge != null ? " At your age that means about " + Math.max(5, Math.min(30, 65 - curAge)) + " years max." : "")} onDec={() => setPropertySim({ tenorYrs: Math.max(5, PS.tenorYrs - 5) })} onInc={() => setPropertySim({ tenorYrs: Math.min(derivedAge != null ? Math.max(5, Math.min(30, 65 - curAge)) : 35, PS.tenorYrs + 5) })} onSet={(nn) => setPropertySim({ tenorYrs: Math.min(derivedAge != null ? Math.max(5, Math.min(30, 65 - curAge)) : 35, Math.max(5, Math.round(nn))) })} />
         <AssumptionRow label="Price appreciation" val={PS.apprPct} unit="%" onDec={() => setPropertySim({ apprPct: Math.max(-2, +(PS.apprPct - 0.5).toFixed(1)) })} onInc={() => setPropertySim({ apprPct: +(PS.apprPct + 0.5).toFixed(1) })} onSet={(nn) => setPropertySim({ apprPct: Math.min(15, Math.max(-5, +nn.toFixed(1))) })} />
         <AssumptionRow label="Holding period" val={PS.holdYrs} unit=" yrs" tip="How long you hold before selling. Selling within 3 years triggers Seller's Stamp Duty (SSD)." onDec={() => setPropertySim({ holdYrs: Math.max(1, PS.holdYrs - 1) })} onInc={() => setPropertySim({ holdYrs: Math.min(30, PS.holdYrs + 1) })} onSet={(nn) => setPropertySim({ holdYrs: Math.min(40, Math.max(1, Math.round(nn))) })} />
         <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 0", borderBottom: "1px solid rgba(20,38,61,.06)" }}>
@@ -1831,6 +1988,8 @@ export default function LumeTracker() {
         )}
       </div>
 
+      </>)}
+      {planTab === "plan" && (<>
       <div style={{ ...glass(24), padding: "17px 18px", marginBottom: 14 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
           <span style={eyebrow}>CPF at 55</span>
@@ -1841,10 +2000,25 @@ export default function LumeTracker() {
           <div style={{ textAlign: "right" }}><div style={{ ...mono(14, 600), color: cpfPct >= 100 ? POS : INK }}>{Math.round(cpfPct)}%</div><div style={{ fontSize: 10.5, color: "rgba(20,38,61,.45)" }}>of {fmtShort(frsHouseholdAt55)}</div></div>
         </div>
         <div style={{ height: 9, borderRadius: 5, background: "rgba(20,38,61,.08)", margin: "10px 0 12px", overflow: "hidden" }}><div style={{ height: "100%", width: cpfPct + "%", borderRadius: 5, background: cpfPct >= 100 ? POS : "linear-gradient(90deg,#3D5A9E,#0E7086)" }} /></div>
-        <AssumptionRow label="Monthly CPF inflows" val={CP.monthlyContrib} unit="$" onDec={() => setCpfPlan({ monthlyContrib: Math.max(0, CP.monthlyContrib - 250) })} onInc={() => setCpfPlan({ monthlyContrib: CP.monthlyContrib + 250 })} onSet={(nn) => setCpfPlan({ monthlyContrib: Math.max(0, Math.round(nn)) })} />
-        <div style={{ fontSize: 11, color: "rgba(20,38,61,.45)", marginTop: 8, lineHeight: 1.5 }}>Blended 3.2% CPF growth · FRS escalated ~3.5%/yr · nominal dollars. CPF LIFE payout modelling comes next.</div>
+        <AssumptionRow label="Gross monthly salary" val={CP.salary || 0} unit="$" tip="Used to estimate CPF inflows: 37% of salary (you + employer), capped at the $6,800 Ordinary Wage ceiling, of which roughly 75% lands in OA+SA (the rest goes to MediSave)." onDec={() => setCpfPlan({ salary: Math.max(0, (CP.salary || 0) - 500) })} onInc={() => setCpfPlan({ salary: (CP.salary || 0) + 500 })} onSet={(nn) => setCpfPlan({ salary: Math.max(0, Math.round(nn)) })} />
+        {cpfAutoContrib != null && (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "9px 0", borderBottom: "1px solid rgba(20,38,61,.06)" }}>
+            <span style={{ fontSize: 13, color: "rgba(20,38,61,.7)", display: "flex", alignItems: "center" }}>Use salary estimate<Tip text={"37% × min(salary, $6,800) × 75% ≈ " + fmt(cpfAutoContrib) + "/mo into OA+SA. Turn off to enter your own figure."} /></span>
+            <Toggle on={!!CP.useSalary} onClick={() => setCpfPlan({ useSalary: !CP.useSalary })} />
+          </div>
+        )}
+        {CP.useSalary && cpfAutoContrib != null ? (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "9px 0", borderBottom: "1px solid rgba(20,38,61,.06)" }}>
+            <span style={{ fontSize: 13, color: "rgba(20,38,61,.7)" }}>Monthly CPF inflows</span>
+            <span style={{ ...mono(13, 600), minWidth: 74, textAlign: "left" }}>{fmt(cpfContrib)}<span style={{ fontSize: 10, color: "rgba(20,38,61,.4)", fontFamily: F_UI, fontWeight: 500 }}> · auto</span></span>
+          </div>
+        ) : (
+          <AssumptionRow label="Monthly CPF inflows" val={CP.monthlyContrib} unit="$" tip="OA + SA only — MediSave is excluded since it can't fund retirement drawdown." onDec={() => setCpfPlan({ monthlyContrib: Math.max(0, CP.monthlyContrib - 250) })} onInc={() => setCpfPlan({ monthlyContrib: CP.monthlyContrib + 250 })} onSet={(nn) => setCpfPlan({ monthlyContrib: Math.max(0, Math.round(nn)) })} />
+        )}
+        <div style={{ fontSize: 11, color: "rgba(20,38,61,.45)", marginTop: 8, lineHeight: 1.5 }}>Current CPF balances compound at a blended 3.2% (OA 2.5%, SA ~4%), plus your monthly inflows, until 55. Compared against 2× the Full Retirement Sum escalated ~3.5%/yr · nominal dollars. CPF LIFE payout modelling comes next.</div>
       </div>
 
+      </>)}
       {!isPremium && (
         <div style={{ position: "absolute", inset: 0, borderRadius: 24, background: "rgba(233,238,246,.45)", backdropFilter: "blur(7px)", WebkitBackdropFilter: "blur(7px)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, zIndex: 5 }}>
           <div style={{ width: 44, height: 44, borderRadius: 16, background: "rgba(255,255,255,.85)", display: "flex", alignItems: "center", justifyContent: "center", boxShadow: "0 10px 24px -10px rgba(23,42,72,.35)" }}><Ico as={Lock} size={19} color={ACCENT} /></div>
@@ -2068,9 +2242,9 @@ ${rowsHtml}
           {locked && (
             <div style={{ position: "absolute", inset: 0, zIndex: 60, background: "rgba(233,238,246,.72)", backdropFilter: "blur(30px) saturate(1.4)", WebkitBackdropFilter: "blur(30px) saturate(1.4)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 18, animation: "fadein .3s", padding: 24 }}>
               <div style={{ width: 66, height: 66, borderRadius: 22, background: "linear-gradient(135deg,#5DC4CB,#8A7FD4)", display: "flex", alignItems: "center", justifyContent: "center", boxShadow: "0 18px 36px -14px rgba(23,42,72,.4)" }}><span style={{ fontWeight: 700, fontSize: 26, color: "#fff" }}>L</span></div>
-              <div style={{ textAlign: "center" }}><div style={{ fontSize: 19, fontWeight: 700 }}>Lume is locked</div><div style={{ fontSize: 12.5, color: "rgba(20,38,61,.55)", marginTop: 4 }}>Unlock with Face ID or fingerprint</div></div>
-              <button onClick={unlockBiometric} style={{ display: "flex", alignItems: "center", gap: 9, height: 50, padding: "0 26px", border: "none", borderRadius: 25, background: INK, color: "#fff", fontFamily: F_UI, fontSize: 14.5, fontWeight: 600, cursor: "pointer", boxShadow: "0 14px 26px -12px rgba(20,38,61,.5)" }}><Ico as={ScanFace} size={17} color="#fff" /> Unlock</button>
-              <button onClick={() => { setLocked(false); signOut(); }} style={{ border: "none", background: "none", color: "rgba(20,38,61,.5)", fontFamily: F_UI, fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>Sign out instead</button>
+              <div style={{ textAlign: "center" }}><div style={{ fontSize: 19, fontWeight: 700 }}>Welcome back{linkedMe ? ", " + linkedMe.name : me ? ", " + me.name : ""}</div><div style={{ fontSize: 12.5, color: "rgba(20,38,61,.55)", marginTop: 4 }}>Sign in with Face ID or fingerprint</div></div>
+              <button onClick={unlockBiometric} style={{ display: "flex", alignItems: "center", gap: 9, height: 50, padding: "0 26px", border: "none", borderRadius: 25, background: INK, color: "#fff", fontFamily: F_UI, fontSize: 14.5, fontWeight: 600, cursor: "pointer", boxShadow: "0 14px 26px -12px rgba(20,38,61,.5)" }}><Ico as={ScanFace} size={17} color="#fff" /> Sign in</button>
+              <button onClick={() => { setLocked(false); signOut(); }} style={{ border: "none", background: "none", color: "rgba(20,38,61,.5)", fontFamily: F_UI, fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>Use a different account</button>
             </div>
           )}
           {screen !== "signin" && Dock()}
@@ -2293,6 +2467,7 @@ function MemberSheet({ member, me, members, grants, onToggleGrant, onClose, onSa
   const [name, setName] = useState(adding ? "" : (member.fullName || member.name));
   const [inviteMode, setInviteMode] = useState(false);
   const [inviteEmail, setInviteEmail] = useState(adding ? "" : (member.inviteEmail || ""));
+  const [birthYear, setBirthYear] = useState(adding || !member.birthYear ? "" : String(member.birthYear));
   const [role, setRole] = useState(adding ? "editor" : member.role);
 
   const initials = (name.trim().split(/\s+/).map(w => w[0]).join("").slice(0, 2) || "?").toUpperCase();
@@ -2303,7 +2478,8 @@ function MemberSheet({ member, me, members, grants, onToggleGrant, onClose, onSa
       const idx = members.length % GRADIENTS._palette.length;
       onSave({ id: "m_" + uid(), name: name.trim().split(/\s+/)[0] || "Member", fullName: name.trim() || "Member", initials, gradient: GRADIENTS._palette[idx], color: MEMBER_COLOR._palette[idx], role: finalRole, joined: "Just now", inviteEmail: inviteMode ? inviteEmail.trim() : "" });
     } else {
-      onSave({ ...member, name: name.trim().split(/\s+/)[0] || member.name, fullName: name.trim(), role: finalRole });
+      const by = parseInt(birthYear, 10);
+      onSave({ ...member, name: name.trim().split(/\s+/)[0] || member.name, fullName: name.trim(), role: finalRole, birthYear: by >= 1920 && by <= new Date().getFullYear() ? by : null });
     }
   };
 
@@ -2319,9 +2495,13 @@ function MemberSheet({ member, me, members, grants, onToggleGrant, onClose, onSa
         </div>
       )}
 
+      {!adding && member.inviteEmail && !member.userId && member.inviteToken && (
+        <button onClick={async () => { const link = window.location.origin + "/?invite=" + member.inviteToken; try { await navigator.clipboard.writeText(link); } catch (e) {} if (navigator.share) { try { await navigator.share({ title: "Lume invite", url: link }); } catch (e) {} } else alert("Invite link copied:\n" + link); }} style={{ width: "100%", marginBottom: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, height: 44, border: "1px dashed rgba(14,112,134,.45)", borderRadius: 22, background: "rgba(14,112,134,.06)", color: ACCENT, fontFamily: F_UI, fontSize: 13, fontWeight: 600, cursor: "pointer" }}><Ico as={LinkI} size={14} color={ACCENT} />Share invite link again</button>
+      )}
       {canEditProfile ? (
         <>
           <div style={{ marginBottom: 12 }}><label style={fieldLabel}>Full name</label><input value={name} onChange={(e) => setName(e.target.value)} placeholder={"e.g. " + (me?.fullName || me?.name || "full name")} style={field} /></div>
+          <div style={{ marginBottom: 12 }}><label style={fieldLabel}>Birth year <span style={{ fontWeight: 400, textTransform: "none", letterSpacing: 0 }}>· optional · drives age in Plan</span></label><input value={birthYear} onChange={(e) => setBirthYear(e.target.value.replace(/\D/g, "").slice(0, 4))} inputMode="numeric" placeholder="e.g. 1990" style={field} /></div>
           {adding && (
             <div style={{ marginBottom: 16 }}>
               <label style={fieldLabel}>Account type</label>
