@@ -684,6 +684,16 @@ export default function LumeTracker() {
       .subscribe();
     return () => { try { supa.removeChannel(ch); } catch (e) {} };
   }, [supa, hid]);
+  // Auto-prompt the biometric sensor as soon as the lock gate appears.
+  // Uses a ref so it never depends on where unlockBiometric is declared.
+  const unlockFnRef = useRef(null);
+  useEffect(() => {
+    if (!locked) { autoBioRef.current = false; return; }
+    if (autoBioRef.current) return;
+    autoBioRef.current = true;
+    const t = setTimeout(() => { if (unlockFnRef.current) unlockFnRef.current(); }, 450);
+    return () => clearTimeout(t);
+  }, [locked]);
   // Biometric lock: lock once on first load if enabled, and on return after the auto-lock window
   useEffect(() => {
     if (!data || initLockRef.current) return;
@@ -1478,12 +1488,6 @@ export default function LumeTracker() {
       setSecurity({ faceId: true, credId });
     } catch (e) { if (e && e.name !== "NotAllowedError") alert("Couldn't set up biometric unlock: " + (e.message || e)); }
   };
-  useEffect(() => {
-    if (!locked || autoBioRef.current) return;
-    autoBioRef.current = true;
-    const t = setTimeout(() => { unlockBiometric(); }, 450);
-    return () => clearTimeout(t);
-  }, [locked]);
   const unlockBiometric = async () => {
     try {
       const raw = Uint8Array.from(atob(SEC.credId), (c) => c.charCodeAt(0));
@@ -1495,6 +1499,7 @@ export default function LumeTracker() {
       setLocked(false); hiddenAtRef.current = null;
     } catch (e) { /* stay locked; user can retry or sign out */ }
   };
+  unlockFnRef.current = unlockBiometric;
   const dataRows = [
     { label: "Export my data", sub: "Downloads CSV + full JSON backup", icon: Download, color: INK, onClick: exportAllData },
     { label: "Active sessions", sub: "This device", icon: Smartphone, color: INK },
